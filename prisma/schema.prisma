@@ -1,0 +1,99 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Better Auth tables
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified Boolean   @default(false)
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  password      String?
+  sessions      Session[]
+  accounts      Account[]
+  recordings    RecordingSession[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  expiresAt DateTime
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountId         String
+  providerId        String
+  accessToken       String? @db.Text
+  refreshToken      String? @db.Text
+  idToken           String? @db.Text
+  accessTokenExpiresAt DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope             String?
+  password          String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([providerId, accountId])
+}
+
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([identifier, value])
+}
+
+// Application tables
+model RecordingSession {
+  id            String           @id @default(cuid())
+  userId        String
+  user          User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title         String?
+  status        SessionStatus    @default(RECORDING)
+  audioUrl      String?
+  transcriptText String?         @db.Text
+  summary       String?          @db.Text
+  duration      Int?             // Duration in seconds
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  chunks        TranscriptChunk[]
+}
+
+model TranscriptChunk {
+  id         String           @id @default(cuid())
+  sessionId  String
+  session    RecordingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  chunkIndex Int
+  text       String           @db.Text
+  timestamp  DateTime         @default(now())
+  confidence Float?
+}
+
+enum SessionStatus {
+  RECORDING
+  PAUSED
+  PROCESSING
+  COMPLETED
+  CANCELLED
+}
