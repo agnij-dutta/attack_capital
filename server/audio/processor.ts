@@ -107,9 +107,15 @@ export class AudioProcessor {
       });
 
       if (session) {
+        // Double-check sessionId matches before saving
+        if (session.id !== sessionId) {
+          console.error(`Session ID mismatch! Expected ${sessionId}, got ${session.id}`);
+          throw new Error(`Session ID mismatch when saving chunk`);
+        }
+        
         await prisma.transcriptChunk.create({
           data: {
-            sessionId,
+            sessionId, // Explicitly use the passed sessionId
             chunkIndex: session.chunks.length,
             text: transcript,
             timestamp: new Date(),
@@ -174,8 +180,27 @@ export class AudioProcessor {
       throw new Error("Session not found");
     }
 
-    // Combine all chunks into full transcript
-    const fullTranscript = session.chunks.map((chunk) => chunk.text).join("\n\n");
+    // Filter chunks to ensure they belong to this session (safety check)
+    const validChunks = session.chunks
+      .filter((chunk) => chunk.sessionId === sessionId)
+      .map((chunk) => chunk.text.trim())
+      .filter((text) => {
+        // Filter out empty chunks and error messages
+        if (!text || text.length === 0) return false;
+        const lowerText = text.toLowerCase();
+        if (
+          lowerText.includes("the audio appears to be silent") ||
+          lowerText.includes("cannot provide a transcription") ||
+          lowerText.includes("no discernible speech") ||
+          lowerText.includes("okay, here's the transcription")
+        ) {
+          return false;
+        }
+        return true;
+      });
+
+    // Combine all valid chunks into full transcript
+    const fullTranscript = validChunks.join("\n\n");
 
     // Generate summary
     const summary = await generateSummary(fullTranscript);

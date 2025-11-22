@@ -36,6 +36,7 @@ export function useAudioRecorder(
   const streamRef = useRef<MediaStream | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const sessionIdRef = useRef<string | null>(null);
 
   /**
    * Initialize WebSocket connection
@@ -67,6 +68,7 @@ export function useAudioRecorder(
 
     socket.on("recording-started", (data: { sessionId: string }) => {
       setSessionId(data.sessionId);
+      sessionIdRef.current = data.sessionId;
       setState("recording");
     });
 
@@ -118,11 +120,23 @@ export function useAudioRecorder(
             },
           });
         } else {
-          // Tab/screen share
-          stream = await navigator.mediaDevices.getDisplayMedia({
-            video: false,
+          // Tab/screen share - must request video, but we'll only use audio track
+          const displayStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true, // Required by browser, even if we only use audio
             audio: true,
           });
+          
+          // Get only the audio track from the display stream
+          const audioTracks = displayStream.getAudioTracks();
+          if (audioTracks.length === 0) {
+            throw new Error("No audio track available from screen share. Please ensure 'Share tab audio' is enabled.");
+          }
+          
+          // Create a new stream with only the audio track
+          stream = new MediaStream(audioTracks);
+          
+          // Stop video tracks to save resources (we don't need them)
+          displayStream.getVideoTracks().forEach((track) => track.stop());
         }
 
         streamRef.current = stream;
@@ -139,6 +153,12 @@ export function useAudioRecorder(
         mediaRecorderRef.current = mediaRecorder;
         audioChunksRef.current = [];
 
+        // Initialize socket and start recording
+        const socket = initializeSocket();
+        const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        setSessionId(newSessionId);
+        sessionIdRef.current = newSessionId;
+
         // Handle data available event
         mediaRecorder.ondataavailable = (event) => {
           if (event.data.size > 0) {
@@ -148,9 +168,10 @@ export function useAudioRecorder(
             const reader = new FileReader();
             reader.onloadend = () => {
               const base64Audio = (reader.result as string).split(",")[1];
-              if (socketRef.current?.connected) {
+              const currentSessionId = sessionIdRef.current;
+              if (socketRef.current?.connected && currentSessionId) {
                 socketRef.current.emit("audio-chunk", {
-                  sessionId,
+                  sessionId: currentSessionId,
                   audioData: base64Audio,
                   mimeType,
                 });
@@ -159,11 +180,6 @@ export function useAudioRecorder(
             reader.readAsDataURL(event.data);
           }
         };
-
-        // Initialize socket and start recording
-        const socket = initializeSocket();
-        const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        setSessionId(newSessionId);
 
         // Start MediaRecorder (send chunks every 1 second)
         mediaRecorder.start(1000);
@@ -187,7 +203,7 @@ export function useAudioRecorder(
         }
       }
     },
-    [userId, initializeSocket, sessionId]
+    [userId, initializeSocket]
   );
 
   /**
@@ -196,11 +212,12 @@ export function useAudioRecorder(
   const pauseRecording = useCallback(() => {
     if (mediaRecorderRef.current && state === "recording") {
       mediaRecorderRef.current.pause();
-      if (socketRef.current && sessionId) {
-        socketRef.current.emit("pause-recording", { sessionId });
+      const currentSessionId = sessionIdRef.current;
+      if (socketRef.current && currentSessionId) {
+        socketRef.current.emit("pause-recording", { sessionId: currentSessionId });
       }
     }
-  }, [state, sessionId]);
+  }, [state]);
 
   /**
    * Resume recording
@@ -208,11 +225,12 @@ export function useAudioRecorder(
   const resumeRecording = useCallback(() => {
     if (mediaRecorderRef.current && state === "paused") {
       mediaRecorderRef.current.resume();
-      if (socketRef.current && sessionId) {
-        socketRef.current.emit("resume-recording", { sessionId });
+      const currentSessionId = sessionIdRef.current;
+      if (socketRef.current && currentSessionId) {
+        socketRef.current.emit("resume-recording", { sessionId: currentSessionId });
       }
     }
-  }, [state, sessionId]);
+  }, [state]);
 
   /**
    * Stop recording
@@ -229,10 +247,11 @@ export function useAudioRecorder(
       streamRef.current = null;
     }
 
-    if (socketRef.current && sessionId) {
-      socketRef.current.emit("stop-recording", { sessionId });
+    const currentSessionId = sessionIdRef.current;
+    if (socketRef.current && currentSessionId) {
+      socketRef.current.emit("stop-recording", { sessionId: currentSessionId });
     }
-  }, [sessionId]);
+  }, []);
 
   /**
    * Cancel recording
@@ -249,14 +268,16 @@ export function useAudioRecorder(
       streamRef.current = null;
     }
 
-    if (socketRef.current && sessionId) {
-      socketRef.current.emit("cancel-recording", { sessionId });
+    const currentSessionId = sessionIdRef.current;
+    if (socketRef.current && currentSessionId) {
+      socketRef.current.emit("cancel-recording", { sessionId: currentSessionId });
     }
 
     setState("idle");
     setSessionId(null);
+    sessionIdRef.current = null;
     audioChunksRef.current = [];
-  }, [sessionId]);
+  }, []);
 
   // Cleanup on unmount
   useEffect(() => {

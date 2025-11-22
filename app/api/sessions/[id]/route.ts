@@ -7,7 +7,7 @@ import { NextResponse } from "next/server";
  */
 export async function GET(
   request: Request,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const session = await auth.api.getSession({
@@ -18,9 +18,10 @@ export async function GET(
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
+    const { id } = await params;
     const dbSession = await prisma.recordingSession.findUnique({
       where: {
-        id: params.id,
+        id,
       },
       include: {
         chunks: {

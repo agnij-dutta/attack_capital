@@ -13,7 +13,9 @@
 
 # testing
 /coverage
-
+.webm
+.webrtc/*
+/server/
 # next.js
 /.next/
 /out/
