@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
 
 /**
  * Middleware to protect routes
+ * Uses cookie-based check to avoid Prisma in Edge runtime
  * Redirects unauthenticated users to sign-in page
  */
 export async function middleware(request: NextRequest) {
@@ -14,25 +14,21 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
-  try {
-    const session = await auth.api.getSession({
-      headers: request.headers,
-    });
+  // Check for Better Auth session cookie
+  // Better Auth uses 'better-auth.session_token' cookie
+  const sessionToken = request.cookies.get("better-auth.session_token");
 
-    if (!session?.user) {
-      const signInUrl = new URL("/sign-in", request.url);
-      signInUrl.searchParams.set("redirect", request.nextUrl.pathname);
-      return NextResponse.redirect(signInUrl);
-    }
-
-    return NextResponse.next();
-  } catch (error) {
+  if (!sessionToken) {
     const signInUrl = new URL("/sign-in", request.url);
+    signInUrl.searchParams.set("redirect", request.nextUrl.pathname);
     return NextResponse.redirect(signInUrl);
   }
+
+  return NextResponse.next();
 }
 
 export const config = {
   matcher: ["/dashboard/:path*", "/sessions/:path*"],
+  runtime: "nodejs", // Use Node.js runtime to support Prisma if needed
 };
 

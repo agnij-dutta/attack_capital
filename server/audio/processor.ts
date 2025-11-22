@@ -1,4 +1,4 @@
-import { PrismaClient, Prisma } from "@prisma/client";
+import { PrismaClient, SessionStatus } from "@prisma/client";
 import { transcribeAudio, generateSummary } from "../lib/gemini";
 import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
@@ -7,15 +7,7 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const prisma = new PrismaClient({
-  datasources: {
-    db: {
-      url: process.env.DATABASE_URL,
-    },
-  },
-});
-
-const { SessionStatus } = Prisma.$Enums;
+const prisma = new PrismaClient();
 const CHUNK_DURATION_MS = 30000; // 30 seconds
 const MAX_BUFFER_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
 

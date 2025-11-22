@@ -6,4 +6,3 @@ import { toNextJsHandler } from "better-auth/next-js";
  * Handles all authentication endpoints (sign-in, sign-up, sign-out, etc.)
  */
 export const { GET, POST } = toNextJsHandler(auth.handler);
-

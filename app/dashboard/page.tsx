@@ -4,12 +4,19 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useAudioRecorder } from "@/hooks/useAudioRecorder";
 import Link from "next/link";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Separator } from "@/components/ui/separator";
+import { Mic, Video, Play, Pause, Square, X, Loader2, History, LogOut, AlertCircle } from "lucide-react";
+import { toast } from "sonner";
+import { Toaster } from "@/components/ui/sonner";
 
 export default function DashboardPage() {
   const router = useRouter();
   const [userId, setUserId] = useState<string>("");
   const [recordingMode, setRecordingMode] = useState<"mic" | "tab">("mic");
-  const [transcript, setTranscript] = useState<string>("");
   const [sessionTime, setSessionTime] = useState<number>(0);
 
   const {
@@ -62,158 +69,195 @@ export default function DashboardPage() {
 
   const handleStop = async () => {
     await stopRecording();
+    toast.success("Recording stopped. Processing transcript...");
     if (sessionId) {
-      router.push(`/sessions/${sessionId}`);
+      setTimeout(() => {
+        router.push(`/sessions/${sessionId}`);
+      }, 1000);
     }
   };
 
+  const handleSignOut = async () => {
+    await fetch("/api/auth/sign-out", { method: "POST" });
+    toast.success("Signed out successfully");
+    router.push("/sign-in");
+  };
+
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800">
+    <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
+      <Toaster />
       <div className="container mx-auto px-4 py-8">
-        <div className="mb-6 flex items-center justify-between">
-          <h1 className="text-3xl font-bold text-gray-900 dark:text-white">Dashboard</h1>
-          <div className="flex gap-4">
-            <Link
-              href="/sessions"
-              className="rounded-lg bg-white px-4 py-2 text-gray-700 shadow-sm transition-colors hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
-            >
-              Sessions
-            </Link>
-            <button
-              onClick={async () => {
-                await fetch("/api/auth/sign-out", { method: "POST" });
-                router.push("/sign-in");
-              }}
-              className="rounded-lg bg-white px-4 py-2 text-gray-700 shadow-sm transition-colors hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
-            >
+        {/* Header */}
+        <div className="mb-8 flex items-center justify-between">
+          <div>
+            <h1 className="text-4xl font-bold tracking-tight">Dashboard</h1>
+            <p className="mt-2 text-muted-foreground">
+              Start recording your meetings and get AI-powered transcripts
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <Button asChild variant="outline">
+              <Link href="/sessions">
+                <History className="mr-2 h-4 w-4" />
+                Sessions
+              </Link>
+            </Button>
+            <Button variant="outline" onClick={handleSignOut}>
+              <LogOut className="mr-2 h-4 w-4" />
               Sign Out
-            </button>
+            </Button>
           </div>
         </div>
 
         <div className="mx-auto max-w-4xl space-y-6">
           {/* Recording Controls */}
-          <div className="rounded-2xl bg-white p-8 shadow-xl dark:bg-gray-800">
-            <h2 className="mb-6 text-2xl font-semibold text-gray-900 dark:text-white">
-              Start Recording
-            </h2>
+          <Card>
+            <CardHeader>
+              <CardTitle>Recording Studio</CardTitle>
+              <CardDescription>
+                Choose your audio source and start recording
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {error && (
+                <Alert variant="destructive">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
+              )}
 
-            {error && (
-              <div className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-600 dark:bg-red-900/20 dark:text-red-400">
-                {error}
-              </div>
-            )}
-
-            {state === "idle" && (
-              <div className="space-y-4">
-                <div className="flex gap-4">
-                  <button
-                    onClick={() => setRecordingMode("mic")}
-                    className={`flex-1 rounded-lg border-2 px-4 py-3 font-medium transition-colors ${
-                      recordingMode === "mic"
-                        ? "border-indigo-600 bg-indigo-50 text-indigo-700 dark:bg-indigo-900/20 dark:text-indigo-400"
-                        : "border-gray-300 bg-white text-gray-700 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-300"
-                    }`}
-                  >
-                    Microphone
-                  </button>
-                  <button
-                    onClick={() => setRecordingMode("tab")}
-                    className={`flex-1 rounded-lg border-2 px-4 py-3 font-medium transition-colors ${
-                      recordingMode === "tab"
-                        ? "border-indigo-600 bg-indigo-50 text-indigo-700 dark:bg-indigo-900/20 dark:text-indigo-400"
-                        : "border-gray-300 bg-white text-gray-700 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-300"
-                    }`}
-                  >
-                    Tab/Share
-                  </button>
-                </div>
-                <button
-                  onClick={() => startRecording(recordingMode)}
-                  className="w-full rounded-lg bg-indigo-600 px-6 py-4 text-lg font-medium text-white transition-colors hover:bg-indigo-700"
-                >
-                  Start Recording
-                </button>
-              </div>
-            )}
-
-            {state === "recording" && (
-              <div className="space-y-4">
-                <div className="text-center">
-                  <div className="mb-2 text-4xl font-bold text-indigo-600 dark:text-indigo-400">
-                    {formatTime(sessionTime)}
+              {state === "idle" && (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <Button
+                      variant={recordingMode === "mic" ? "default" : "outline"}
+                      size="lg"
+                      className="h-24 flex-col gap-2"
+                      onClick={() => setRecordingMode("mic")}
+                    >
+                      <Mic className="h-6 w-6" />
+                      <span>Microphone</span>
+                    </Button>
+                    <Button
+                      variant={recordingMode === "tab" ? "default" : "outline"}
+                      size="lg"
+                      className="h-24 flex-col gap-2"
+                      onClick={() => setRecordingMode("tab")}
+                    >
+                      <Video className="h-6 w-6" />
+                      <span>Tab/Share</span>
+                    </Button>
                   </div>
-                  <div className="flex items-center justify-center gap-2 text-red-600 dark:text-red-400">
-                    <div className="h-3 w-3 animate-pulse rounded-full bg-red-600"></div>
-                    <span className="font-medium">Recording</span>
+                  <Button
+                    onClick={() => startRecording(recordingMode)}
+                    size="lg"
+                    className="w-full"
+                  >
+                    <Play className="mr-2 h-5 w-5" />
+                    Start Recording
+                  </Button>
+                </div>
+              )}
+
+              {state === "recording" && (
+                <div className="space-y-6">
+                  <div className="text-center space-y-2">
+                    <div className="text-6xl font-bold text-primary">
+                      {formatTime(sessionTime)}
+                    </div>
+                    <Badge variant="destructive" className="gap-2">
+                      <div className="h-2 w-2 animate-pulse rounded-full bg-current" />
+                      Recording
+                    </Badge>
+                  </div>
+                  <Separator />
+                  <div className="grid grid-cols-3 gap-3">
+                    <Button
+                      onClick={pauseRecording}
+                      variant="outline"
+                      size="lg"
+                      className="gap-2"
+                    >
+                      <Pause className="h-4 w-4" />
+                      Pause
+                    </Button>
+                    <Button
+                      onClick={handleStop}
+                      variant="destructive"
+                      size="lg"
+                      className="gap-2"
+                    >
+                      <Square className="h-4 w-4" />
+                      Stop
+                    </Button>
+                    <Button
+                      onClick={cancelRecording}
+                      variant="outline"
+                      size="lg"
+                      className="gap-2"
+                    >
+                      <X className="h-4 w-4" />
+                      Cancel
+                    </Button>
                   </div>
                 </div>
-                <div className="flex gap-4">
-                  <button
-                    onClick={pauseRecording}
-                    className="flex-1 rounded-lg bg-yellow-500 px-4 py-3 font-medium text-white transition-colors hover:bg-yellow-600"
-                  >
-                    Pause
-                  </button>
-                  <button
-                    onClick={handleStop}
-                    className="flex-1 rounded-lg bg-red-600 px-4 py-3 font-medium text-white transition-colors hover:bg-red-700"
-                  >
-                    Stop
-                  </button>
-                  <button
-                    onClick={cancelRecording}
-                    className="flex-1 rounded-lg border border-gray-300 bg-white px-4 py-3 font-medium text-gray-700 transition-colors hover:bg-gray-50 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
+              )}
 
-            {state === "paused" && (
-              <div className="space-y-4">
-                <div className="text-center">
-                  <div className="mb-2 text-4xl font-bold text-gray-600 dark:text-gray-400">
-                    {formatTime(sessionTime)}
+              {state === "paused" && (
+                <div className="space-y-6">
+                  <div className="text-center space-y-2">
+                    <div className="text-6xl font-bold text-muted-foreground">
+                      {formatTime(sessionTime)}
+                    </div>
+                    <Badge variant="secondary">Paused</Badge>
                   </div>
-                  <div className="text-yellow-600 dark:text-yellow-400">Paused</div>
+                  <Separator />
+                  <div className="grid grid-cols-3 gap-3">
+                    <Button
+                      onClick={resumeRecording}
+                      size="lg"
+                      className="gap-2"
+                    >
+                      <Play className="h-4 w-4" />
+                      Resume
+                    </Button>
+                    <Button
+                      onClick={handleStop}
+                      variant="destructive"
+                      size="lg"
+                      className="gap-2"
+                    >
+                      <Square className="h-4 w-4" />
+                      Stop
+                    </Button>
+                    <Button
+                      onClick={cancelRecording}
+                      variant="outline"
+                      size="lg"
+                      className="gap-2"
+                    >
+                      <X className="h-4 w-4" />
+                      Cancel
+                    </Button>
+                  </div>
                 </div>
-                <div className="flex gap-4">
-                  <button
-                    onClick={resumeRecording}
-                    className="flex-1 rounded-lg bg-indigo-600 px-4 py-3 font-medium text-white transition-colors hover:bg-indigo-700"
-                  >
-                    Resume
-                  </button>
-                  <button
-                    onClick={handleStop}
-                    className="flex-1 rounded-lg bg-red-600 px-4 py-3 font-medium text-white transition-colors hover:bg-red-700"
-                  >
-                    Stop
-                  </button>
-                  <button
-                    onClick={cancelRecording}
-                    className="flex-1 rounded-lg border border-gray-300 bg-white px-4 py-3 font-medium text-gray-700 transition-colors hover:bg-gray-50 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
+              )}
 
-            {state === "processing" && (
-              <div className="text-center">
-                <div className="mb-4 text-lg font-medium text-gray-700 dark:text-gray-300">
-                  Processing transcript...
+              {state === "processing" && (
+                <div className="flex flex-col items-center justify-center py-12 space-y-4">
+                  <Loader2 className="h-12 w-12 animate-spin text-primary" />
+                  <div className="text-center space-y-2">
+                    <p className="text-lg font-semibold">Processing transcript...</p>
+                    <p className="text-sm text-muted-foreground">
+                      Generating AI summary
+                    </p>
+                  </div>
                 </div>
-                <div className="inline-block h-8 w-8 animate-spin rounded-full border-4 border-indigo-600 border-t-transparent"></div>
-              </div>
-            )}
-          </div>
+              )}
+            </CardContent>
+          </Card>
         </div>
       </div>
     </div>
   );
 }
-
