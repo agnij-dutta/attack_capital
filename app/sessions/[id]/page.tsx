@@ -68,8 +68,8 @@ export default function SessionDetailPage() {
         
         if (data.session) {
           setSession(data.session);
-          // Keep loading state if session is still processing
-          if (data.session.status === "PROCESSING") {
+          // Keep loading state if session is still processing or recording
+          if (data.session.status === "PROCESSING" || data.session.status === "RECORDING") {
             setLoading(true); // Keep loading state
           } else {
             setLoading(false);
@@ -100,17 +100,19 @@ export default function SessionDetailPage() {
     };
   }, [sessionId, router]);
 
-  // Poll for updates when session is processing - keep loading state until COMPLETED
+  // Poll for updates when session is processing or recording - keep loading state until COMPLETED
   useEffect(() => {
-    if (!session || session.status !== "PROCESSING") {
-      // If session is not processing, ensure loading is false
+    if (!session || (session.status !== "PROCESSING" && session.status !== "RECORDING")) {
+      // If session is not processing or recording, ensure loading is false
       if (session && session.status === "COMPLETED") {
+        setLoading(false);
+      } else if (session && session.status !== "PROCESSING" && session.status !== "RECORDING") {
         setLoading(false);
       }
       return;
     }
 
-    // Keep loading state while processing
+    // Keep loading state while processing or recording
     setLoading(true);
 
     let progressInterval: NodeJS.Timeout;
@@ -136,31 +138,42 @@ export default function SessionDetailPage() {
 
     progressInterval = setInterval(updateProgress, 800);
 
-    // Poll for session updates with faster polling for low latency
+    let isPolling = false; // Prevent concurrent polls
+    
+    // Poll for session updates with controlled frequency
     const pollSession = async () => {
+      if (isPolling) return; // Skip if already polling
+      
       try {
+        isPolling = true;
         const response = await fetch(`/api/sessions/${sessionId}`);
         if (response.ok) {
           const data = await response.json();
-          if (data.session.status !== "PROCESSING") {
+          if (data.session.status !== "PROCESSING" && data.session.status !== "RECORDING") {
             setSession(data.session);
             setProgress(100);
             setStatusMessage("Complete!");
-            setLoading(false); // Stop loading when status changes from PROCESSING
+            setLoading(false); // Stop loading when status changes from PROCESSING/RECORDING
             clearInterval(progressInterval);
             clearInterval(fetchInterval);
           } else {
-            // Still processing, update session data but keep loading
+            // Still processing or recording, update session data but keep loading
             setSession(data.session);
+            // Update status message based on status
+            if (data.session.status === "RECORDING") {
+              setStatusMessage("Recording in progress...");
+            }
           }
         }
       } catch (error) {
         console.error("Error polling session:", error);
+      } finally {
+        isPolling = false;
       }
     };
 
-    // Poll every 1.5 seconds for faster updates
-    fetchInterval = setInterval(pollSession, 1500);
+    // Poll every 2 seconds (reduced frequency to prevent excessive requests)
+    fetchInterval = setInterval(pollSession, 2000);
     // Also poll immediately
     pollSession();
 
@@ -313,8 +326,8 @@ export default function SessionDetailPage() {
     );
   }
 
-  // Show processing screen with progress
-  if (session.status === "PROCESSING") {
+  // Show processing/recording screen with progress
+  if (session.status === "PROCESSING" || session.status === "RECORDING") {
     return (
       <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20 flex items-center justify-center">
         <Toaster />
@@ -325,9 +338,13 @@ export default function SessionDetailPage() {
             </div>
             <div className="space-y-4">
               <h2 className="text-2xl font-bold text-gray-900 dark:text-white">
-                Processing Your Session
+                {session.status === "RECORDING" ? "Recording in Progress" : "Processing Your Session"}
               </h2>
-              <p className="text-muted-foreground">{statusMessage}</p>
+              <p className="text-muted-foreground">
+                {session.status === "RECORDING" 
+                  ? "Your session is being recorded. The transcript will appear here once processing is complete."
+                  : statusMessage}
+              </p>
               <div className="space-y-2">
                 <Progress value={progress} className="w-full" />
                 <p className="text-sm text-muted-foreground">{Math.round(progress)}%</p>

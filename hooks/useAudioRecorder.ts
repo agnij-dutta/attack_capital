@@ -123,39 +123,224 @@ export function useAudioRecorder(
             audio: {
               echoCancellation: true,
               noiseSuppression: true,
-              sampleRate: 44100,
+              autoGainControl: true,
+              sampleRate: 48000, // Higher sample rate for better quality (CD quality is 44.1kHz, professional is 48kHz)
+              channelCount: 1, // Mono is fine for speech, but ensure consistent quality
             },
           });
-        } else {
-          // Tab/screen share - must request video, but we'll only use audio track
-          const displayStream = await navigator.mediaDevices.getDisplayMedia({
-            video: true, // Required by browser, even if we only use audio
-            audio: true,
+          
+          // Verify audio track is actually capturing
+          const audioTracks = stream.getAudioTracks();
+          if (audioTracks.length === 0) {
+            throw new Error("No audio tracks available from microphone");
+          }
+          
+          const activeTrack = audioTracks[0];
+          console.log(`[AudioRecorder] Microphone track:`, {
+            label: activeTrack.label,
+            enabled: activeTrack.enabled,
+            readyState: activeTrack.readyState,
+            muted: activeTrack.muted,
+            settings: activeTrack.getSettings(),
           });
+          
+          // Set up audio level monitoring to verify audio is being captured
+          const audioContext = new AudioContext();
+          const source = audioContext.createMediaStreamSource(stream);
+          const analyser = audioContext.createAnalyser();
+          analyser.fftSize = 256;
+          source.connect(analyser);
+          
+          // Check audio levels after a short delay
+          setTimeout(() => {
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(dataArray);
+            const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+            console.log(`[AudioRecorder] Audio level check: average=${average.toFixed(2)}`);
+            if (average < 1) {
+              console.warn(`[AudioRecorder] Very low audio levels detected - microphone may not be capturing audio properly`);
+            }
+            audioContext.close();
+          }, 1000);
+        } else {
+          // Tab/screen share - captures ALL audio from the shared tab
+          // IMPORTANT: When "Share tab audio" is enabled in Google Meet, this captures:
+          // - All participants' audio (mixed together by Google Meet)
+          // - The person sharing's audio (also mixed in)
+          // - Any system sounds from that tab
+          // This is the mixed audio output from the tab, so all meeting participants are included
+          const displayStream = await navigator.mediaDevices.getDisplayMedia({
+            video: {
+              displaySurface: "browser", // Prefer browser tab sharing for better audio capture
+            } as MediaTrackConstraints,
+            audio: {
+              echoCancellation: false, // Disable - we want the raw mixed audio from the tab
+              noiseSuppression: false, // Disable - we want all audio including all participants
+              autoGainControl: false, // Disable - preserve original audio levels from meeting
+              sampleRate: 48000, // Higher sample rate for better quality (professional audio)
+              channelCount: 2, // Stereo if available - captures full audio spectrum
+            },
+          });
+          
+          // Wait longer for audio tracks to be available (Google Meet may need more time)
+          // Also check if audio tracks become available during the wait
+          let audioTracksAvailable = false;
+          for (let i = 0; i < 10; i++) {
+            await new Promise(resolve => setTimeout(resolve, 200));
+            const tracks = displayStream.getAudioTracks();
+            if (tracks.length > 0 && tracks.some(t => t.readyState === "live")) {
+              audioTracksAvailable = true;
+              break;
+            }
+          }
+          
+          if (!audioTracksAvailable) {
+            console.warn("[AudioRecorder] Audio tracks not available after waiting - Google Meet may need more time to initialize audio");
+          }
           
           // Get only the audio track from the display stream
           const audioTracks = displayStream.getAudioTracks();
           if (audioTracks.length === 0) {
-            throw new Error("No audio track available from screen share. Please ensure 'Share tab audio' is enabled.");
+            // Stop video tracks before throwing error
+            displayStream.getVideoTracks().forEach((track) => track.stop());
+            throw new Error("No audio track available from screen share. Please ensure 'Share tab audio' is enabled in your browser's share dialog when sharing the Google Meet tab.");
           }
           
+          // Verify audio track is actually active
+          const activeAudioTrack = audioTracks.find(track => track.readyState === "live" && track.enabled);
+          if (!activeAudioTrack) {
+            displayStream.getVideoTracks().forEach((track) => track.stop());
+            throw new Error("Audio track is not active. Please ensure 'Share tab audio' is checked when sharing.");
+          }
+          
+          const trackSettings = activeAudioTrack.getSettings();
+          console.log(`[AudioRecorder] Tab audio track captured:`, {
+            label: activeAudioTrack.label,
+            enabled: activeAudioTrack.enabled,
+            readyState: activeAudioTrack.readyState,
+            muted: activeAudioTrack.muted,
+            sampleRate: trackSettings.sampleRate,
+            channelCount: trackSettings.channelCount,
+            echoCancellation: trackSettings.echoCancellation,
+            noiseSuppression: trackSettings.noiseSuppression,
+            autoGainControl: trackSettings.autoGainControl,
+          });
+          
+          // Log important info about what audio is being captured
+          console.log(`[AudioRecorder] ✅ Tab audio capture active - This will capture ALL audio from the shared tab, including:`);
+          console.log(`[AudioRecorder]   - All meeting participants' voices (mixed by Google Meet)`);
+          console.log(`[AudioRecorder]   - The person sharing's voice (also in the mix)`);
+          console.log(`[AudioRecorder]   - Any system sounds from that tab`);
+          
           // Create a new stream with only the audio track
-          stream = new MediaStream(audioTracks);
+          // This audio track contains the MIXED audio from the tab, which includes:
+          // - All meeting participants' voices (mixed by Google Meet)
+          // - The person sharing's voice (also in the mix)
+          // - System sounds from that tab
+          stream = new MediaStream([activeAudioTrack]);
+          
+          // Set up continuous audio level monitoring for tab audio
+          // This helps verify that we're actually capturing audio from the meeting
+          const audioContext = new AudioContext({ sampleRate: 48000 });
+          const source = audioContext.createMediaStreamSource(stream);
+          const analyser = audioContext.createAnalyser();
+          analyser.fftSize = 512; // Larger FFT for better frequency analysis
+          analyser.smoothingTimeConstant = 0.8;
+          source.connect(analyser);
+          
+          // Verify we have a valid audio stream
+          console.log(`[AudioRecorder] ✅ Tab audio stream created successfully`);
+          console.log(`[AudioRecorder]   Stream contains ${stream.getAudioTracks().length} audio track(s)`);
+          console.log(`[AudioRecorder]   This will transcribe ALL participants in the meeting`);
+          
+          // Monitor audio levels continuously
+          let audioLevelCheckCount = 0;
+          const checkAudioLevels = () => {
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(dataArray);
+            const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+            const max = Math.max(...Array.from(dataArray));
+            
+            if (audioLevelCheckCount < 5) {
+              console.log(`[AudioRecorder] Tab audio level check ${audioLevelCheckCount + 1}: average=${average.toFixed(2)}, max=${max}`);
+              audioLevelCheckCount++;
+              
+              if (average < 0.5 && max < 5) {
+                console.warn(`[AudioRecorder] ⚠️ Very low audio levels from tab - audio may not be captured properly.`);
+                console.warn(`[AudioRecorder]   - Ensure Google Meet audio is playing (unmute speakers/headphones)`);
+                console.warn(`[AudioRecorder]   - Ensure participants are speaking or audio is playing in the meeting`);
+                console.warn(`[AudioRecorder]   - Check that "Share tab audio" was enabled when sharing`);
+              } else {
+                console.log(`[AudioRecorder] ✅ Audio levels normal - capturing meeting audio successfully`);
+              }
+              
+              if (audioLevelCheckCount < 5) {
+                setTimeout(checkAudioLevels, 2000);
+              } else {
+                audioContext.close();
+              }
+            }
+          };
+          
+          // Start checking after a delay
+          setTimeout(checkAudioLevels, 2000);
           
           // Stop video tracks to save resources (we don't need them)
           displayStream.getVideoTracks().forEach((track) => track.stop());
+          
+          // Monitor audio track for disconnection
+          activeAudioTrack.onended = () => {
+            console.warn("[AudioRecorder] Audio track ended - user may have stopped sharing");
+            setError("Audio sharing was stopped. Please restart the recording.");
+            audioContext.close();
+          };
         }
 
         streamRef.current = stream;
 
-        // Initialize MediaRecorder
-        const mimeType = MediaRecorder.isTypeSupported("audio/webm")
+        // Verify audio tracks are active
+        const audioTracks = stream.getAudioTracks();
+        if (audioTracks.length === 0) {
+          throw new Error("No audio tracks available in stream");
+        }
+
+        const activeTrack = audioTracks.find(track => track.readyState === "live" && track.enabled);
+        if (!activeTrack) {
+          throw new Error("Audio track is not active or enabled");
+        }
+
+        console.log(`[AudioRecorder] Audio track state:`, {
+          label: activeTrack.label,
+          enabled: activeTrack.enabled,
+          readyState: activeTrack.readyState,
+          muted: activeTrack.muted,
+          settings: activeTrack.getSettings(),
+        });
+
+        // Initialize MediaRecorder with optimal settings for quality
+        // For tab audio (Google Meet), use higher bitrate for better quality
+        const isTabAudio = mode === "tab";
+        const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus"
+          : MediaRecorder.isTypeSupported("audio/webm")
           ? "audio/webm"
           : "audio/mp4";
-        const mediaRecorder = new MediaRecorder(stream, {
+        
+        // Higher bitrate for better quality transcription accuracy
+        // Opus codec supports up to 510kbps, but 256kbps is excellent for speech
+        // For tab audio (meetings), use higher bitrate to preserve all audio details
+        const audioBitsPerSecond = isTabAudio ? 256000 : 192000; // Increased from 192k/128k
+        
+        // Additional MediaRecorder options for better quality
+        const mediaRecorderOptions: MediaRecorderOptions = {
           mimeType,
-          audioBitsPerSecond: 128000,
-        });
+          audioBitsPerSecond,
+        };
+        
+        // Try to set videoBitsPerSecond if supported (some browsers use this for audio quality)
+        const mediaRecorder = new MediaRecorder(stream, mediaRecorderOptions);
+        
+        console.log(`[AudioRecorder] MediaRecorder initialized: mimeType=${mimeType}, bitrate=${audioBitsPerSecond}, mode=${mode}`);
 
         mediaRecorderRef.current = mediaRecorder;
         audioChunksRef.current = [];
@@ -172,7 +357,13 @@ export function useAudioRecorder(
 
         // Handle data available event
         mediaRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
+          if (event.data && event.data.size > 0) {
+            // Only send chunks that are substantial (at least 1KB to avoid empty/silent chunks)
+            if (event.data.size < 1024) {
+              console.warn(`[AudioRecorder] Skipping small chunk: ${event.data.size} bytes`);
+              return;
+            }
+
             audioChunksRef.current.push(event.data);
 
             // Send chunk to server via WebSocket
@@ -180,7 +371,8 @@ export function useAudioRecorder(
             reader.onloadend = () => {
               const base64Audio = (reader.result as string).split(",")[1];
               const currentSessionId = sessionIdRef.current;
-              if (socketRef.current?.connected && currentSessionId) {
+              if (socketRef.current?.connected && currentSessionId && base64Audio) {
+                console.log(`[AudioRecorder] Sending audio chunk: ${event.data.size} bytes, base64 length: ${base64Audio.length}`);
                 socketRef.current.emit("audio-chunk", {
                   sessionId: currentSessionId,
                   audioData: base64Audio,
@@ -188,12 +380,26 @@ export function useAudioRecorder(
                 });
               }
             };
+            reader.onerror = (error) => {
+              console.error("[AudioRecorder] Error reading audio chunk:", error);
+            };
             reader.readAsDataURL(event.data);
+          } else {
+            console.warn(`[AudioRecorder] Received empty or invalid chunk: size=${event.data?.size || 0}`);
           }
         };
 
-        // Start MediaRecorder (send chunks every 1 second)
-        mediaRecorder.start(1000);
+        mediaRecorder.onerror = (event) => {
+          console.error("[AudioRecorder] MediaRecorder error:", event);
+          setError("Recording error occurred");
+        };
+
+        // Start MediaRecorder with optimal chunk interval for quality and real-time transcription
+        // 1.5 seconds provides good balance: frequent enough for real-time, large enough for quality
+        const chunkInterval = 1500; // 1.5 seconds
+        mediaRecorder.start(chunkInterval);
+        console.log(`[AudioRecorder] Started recording with ${chunkInterval}ms chunk interval, bitrate: ${audioBitsPerSecond}bps`);
+        console.log(`[AudioRecorder] Started recording with mimeType: ${mimeType}`);
 
         // Notify server
         socket.emit("start-recording", {

@@ -271,7 +271,7 @@ export default function DashboardPage() {
                           </div>
                         ) : (
                           <p className="text-muted-foreground italic">
-                            Listening... Transcription will appear here as audio is processed (every 30 seconds)
+                            Listening... Transcription will appear here as audio is processed (every 8 seconds)
                           </p>
                         )}
                       </div>

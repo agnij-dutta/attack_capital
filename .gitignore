@@ -13,8 +13,21 @@
 
 # testing
 /coverage
-.webm
 .webrtc/*
+
+# audio files
+*.webm
+*.mp3
+*.wav
+*.ogg
+*.m4a
+*.aac
+*.flac
+
+# audio session directories (generated at runtime)
+**/audio/sessions/
+server/audio/sessions/
+server/server/audio/sessions/
 /server/
 # next.js
 /.next/

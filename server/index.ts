@@ -4,7 +4,7 @@ import { Server } from "socket.io";
 import cors from "cors";
 import dotenv from "dotenv";
 import { setupSocketHandlers } from "./sockets/handlers";
-import { setSocketIOInstance } from "./audio/processor";
+import { setSocketIOInstance, audioProcessor } from "./audio/processor";
 
 dotenv.config();
 
@@ -45,4 +45,12 @@ const PORT = process.env.PORT || 4000;
 
 httpServer.listen(PORT, () => {
   console.log(`WebSocket server running on port ${PORT}`);
+  
+  // Clean up old audio files on startup and then every 24 hours
+  audioProcessor.cleanupOldAudioFiles().catch(console.error);
+  
+  // Schedule periodic cleanup (every 24 hours)
+  setInterval(() => {
+    audioProcessor.cleanupOldAudioFiles().catch(console.error);
+  }, 24 * 60 * 60 * 1000);
 });
