@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useAudioRecorder } from "@/hooks/useAudioRecorder";
 import Link from "next/link";
@@ -12,12 +12,15 @@ import { Separator } from "@/components/ui/separator";
 import { Mic, Video, Play, Pause, Square, X, Loader2, History, LogOut, AlertCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
+import { io, Socket } from "socket.io-client";
+import { AIVoiceInput } from "@/components/ui/ai-voice-input";
 
 export default function DashboardPage() {
   const router = useRouter();
   const [userId, setUserId] = useState<string>("");
   const [recordingMode, setRecordingMode] = useState<"mic" | "tab">("mic");
   const [sessionTime, setSessionTime] = useState<number>(0);
+  const [liveTranscript, setLiveTranscript] = useState<string[]>([]);
 
   const {
     isRecording,
@@ -60,6 +63,80 @@ export default function DashboardPage() {
     }
     return () => clearInterval(interval);
   }, [isRecording, isPaused]);
+
+  // Listen for live transcript updates with optimized socket connection
+  useEffect(() => {
+    if (!sessionId || !isRecording) {
+      setLiveTranscript([]);
+      return;
+    }
+
+    let socket: Socket | null = null;
+    let reconnectTimeout: NodeJS.Timeout | null = null;
+
+    const connectSocket = () => {
+      socket = io("http://localhost:4000", {
+        transports: ["websocket"],
+        reconnection: true,
+        reconnectionDelay: 500,
+        reconnectionAttempts: 10,
+        timeout: 5000,
+      });
+
+      socket.on("connect", () => {
+        console.log("[Dashboard] Socket connected for live transcription");
+        // Join the session room to receive updates
+        socket?.emit("join-session", sessionId);
+        console.log(`[Dashboard] Joined session room: ${sessionId}`);
+      });
+
+      socket.on("live-transcript-update", (data: { sessionId: string; newChunk: { text: string; chunkIndex: number } }) => {
+        console.log("[Dashboard] Received live transcript update:", data);
+        if (data.sessionId === sessionId && data.newChunk?.text && data.newChunk.text.trim()) {
+          const transcriptText = data.newChunk.text.trim();
+          console.log("[Dashboard] Adding transcript chunk:", transcriptText);
+          setLiveTranscript((prev) => {
+            // Check if this chunk index already exists (avoid duplicates)
+            const existingIndex = prev.findIndex((_, idx) => idx === data.newChunk.chunkIndex);
+            if (existingIndex >= 0) {
+              // Update existing chunk
+              const updated = [...prev];
+              updated[existingIndex] = transcriptText;
+              return updated;
+            } else {
+              // Append new chunk
+              return [...prev, transcriptText];
+            }
+          });
+        } else {
+          console.warn("[Dashboard] Transcript update rejected:", {
+            sessionMatch: data.sessionId === sessionId,
+            hasText: !!data.newChunk?.text?.trim(),
+            sessionId,
+            receivedSessionId: data.sessionId,
+          });
+        }
+      });
+
+      socket.on("disconnect", () => {
+        console.log("[Dashboard] Socket disconnected, will reconnect...");
+      });
+
+      socket.on("connect_error", (error) => {
+        console.error("[Dashboard] Socket connection error:", error);
+      });
+    };
+
+    connectSocket();
+
+    return () => {
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (socket) {
+        socket.disconnect();
+        socket = null;
+      }
+    };
+  }, [sessionId, isRecording]);
 
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
@@ -161,16 +238,46 @@ export default function DashboardPage() {
 
               {state === "recording" && (
                 <div className="space-y-6">
-                  <div className="text-center space-y-2">
-                    <div className="text-6xl font-bold text-primary">
-                      {formatTime(sessionTime)}
-                    </div>
-                    <Badge variant="destructive" className="gap-2">
-                      <div className="h-2 w-2 animate-pulse rounded-full bg-current" />
-                      Recording
-                    </Badge>
-                  </div>
+                  {/* Mic Animation - Now includes timer and is bigger */}
+                  <AIVoiceInput
+                    onStart={() => {}}
+                    onStop={() => {}}
+                    visualizerBars={64}
+                    demoMode={false}
+                    isRecording={true}
+                    externalTime={sessionTime}
+                    className="bg-transparent"
+                  />
+                  
                   <Separator />
+                  
+                  {/* Live Transcript Display - Always show when recording */}
+                  <Card className="bg-muted/50">
+                    <CardHeader>
+                      <CardTitle className="text-sm flex items-center gap-2">
+                        <div className="h-2 w-2 rounded-full bg-red-500 animate-pulse" />
+                        Live Transcription
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent>
+                      <div className="max-h-64 overflow-y-auto space-y-2 text-sm min-h-[100px]">
+                        {liveTranscript.length > 0 ? (
+                          <div className="space-y-2">
+                            {liveTranscript.map((chunk, idx) => (
+                              <p key={idx} className="text-foreground animate-in fade-in duration-300">
+                                {chunk}
+                              </p>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-muted-foreground italic">
+                            Listening... Transcription will appear here as audio is processed (every 30 seconds)
+                          </p>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+
                   <div className="grid grid-cols-3 gap-3">
                     <Button
                       onClick={pauseRecording}

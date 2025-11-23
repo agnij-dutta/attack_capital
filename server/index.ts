@@ -4,19 +4,24 @@ import { Server } from "socket.io";
 import cors from "cors";
 import dotenv from "dotenv";
 import { setupSocketHandlers } from "./sockets/handlers";
+import { setSocketIOInstance } from "./audio/processor";
 
 dotenv.config();
 
 const app = express();
 const httpServer = createServer(app);
 
-// CORS configuration for Next.js frontend
+// CORS configuration for Next.js frontend with low-latency optimizations
 const io = new Server(httpServer, {
   cors: {
     origin: process.env.FRONTEND_URL || "http://localhost:3000",
     methods: ["GET", "POST"],
     credentials: true,
   },
+  transports: ["websocket"], // Force websocket for lower latency
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  allowEIO3: true,
 });
 
 app.use(cors());
@@ -26,6 +31,9 @@ app.use(express.json());
 app.get("/health", (req: express.Request, res: express.Response) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
+
+// Set socket.io instance for audio processor
+setSocketIOInstance(io);
 
 // Socket.io connection handling
 io.on("connection", (socket) => {

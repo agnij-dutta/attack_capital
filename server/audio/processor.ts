@@ -4,12 +4,20 @@ import { writeFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { existsSync } from "fs";
 import dotenv from "dotenv";
+import { Server as SocketIOServer } from "socket.io";
 
 dotenv.config();
 
 const prisma = new PrismaClient();
 const CHUNK_DURATION_MS = 30000; // 30 seconds
 const MAX_BUFFER_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
+
+// Store socket.io instance for real-time updates
+let ioInstance: SocketIOServer | null = null;
+
+export function setSocketIOInstance(io: SocketIOServer) {
+  ioInstance = io;
+}
 
 /**
  * Audio processor for handling streaming audio chunks
@@ -113,7 +121,7 @@ export class AudioProcessor {
           throw new Error(`Session ID mismatch when saving chunk`);
         }
         
-        await prisma.transcriptChunk.create({
+        const chunk = await prisma.transcriptChunk.create({
           data: {
             sessionId, // Explicitly use the passed sessionId
             chunkIndex: session.chunks.length,
@@ -121,6 +129,22 @@ export class AudioProcessor {
             timestamp: new Date(),
           },
         });
+
+        // Emit real-time transcript update to clients in the session room
+        if (ioInstance && transcript.trim()) {
+          const updateData = {
+            sessionId,
+            newChunk: {
+              chunkIndex: chunk.chunkIndex,
+              text: transcript,
+              timestamp: chunk.timestamp.toISOString(),
+            },
+          };
+          console.log(`[AudioProcessor] Emitting live-transcript-update to session ${sessionId}:`, updateData);
+          ioInstance.to(sessionId).emit("live-transcript-update", updateData);
+        } else {
+          console.warn(`[AudioProcessor] Cannot emit transcript: ioInstance=${!!ioInstance}, transcriptLength=${transcript.trim().length}`);
+        }
       }
 
       // Clear processed buffers

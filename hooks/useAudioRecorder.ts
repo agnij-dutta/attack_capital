@@ -53,6 +53,10 @@ export function useAudioRecorder(
 
     socket.on("connect", () => {
       console.log("WebSocket connected");
+      if (sessionIdRef.current) {
+        socket.emit("join-session", sessionIdRef.current);
+        console.log(`Joined session room: ${sessionIdRef.current}`);
+      }
     });
 
     socket.on("disconnect", () => {
@@ -69,6 +73,9 @@ export function useAudioRecorder(
     socket.on("recording-started", (data: { sessionId: string }) => {
       setSessionId(data.sessionId);
       sessionIdRef.current = data.sessionId;
+      // Join the session room to receive live updates
+      socket.emit("join-session", data.sessionId);
+      console.log(`Joined session room: ${data.sessionId}`);
       setState("recording");
     });
 
@@ -158,6 +165,10 @@ export function useAudioRecorder(
         const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         setSessionId(newSessionId);
         sessionIdRef.current = newSessionId;
+
+        // Join the session room immediately to receive live updates
+        socket.emit("join-session", newSessionId);
+        console.log(`Joined session room: ${newSessionId}`);
 
         // Handle data available event
         mediaRecorder.ondataavailable = (event) => {

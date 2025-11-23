@@ -32,6 +32,16 @@ export function setupSocketHandlers(socket: Socket, io: Server): void {
   });
 
   /**
+   * Join a session room to receive live transcript updates
+   */
+  socket.on("join-session", (sessionId: string) => {
+    if (sessionId) {
+      socket.join(sessionId);
+      console.log(`Client ${socket.id} joined session room: ${sessionId}`);
+    }
+  });
+
+  /**
    * Start a new recording session
    */
   socket.on("start-recording", async (data: unknown) => {

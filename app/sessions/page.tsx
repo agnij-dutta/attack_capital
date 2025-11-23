@@ -3,6 +3,10 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import LoadingLines from "@/components/ui/loading-lines";
 
 interface Session {
   id: string;
@@ -50,93 +54,91 @@ export default function SessionsPage() {
     return new Date(dateString).toLocaleString();
   };
 
-  const getStatusColor = (status: string) => {
-    switch (status) {
-      case "COMPLETED":
-        return "bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400";
-      case "RECORDING":
-        return "bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400";
-      case "PROCESSING":
-        return "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400";
-      case "PAUSED":
-        return "bg-gray-100 text-gray-800 dark:bg-gray-900/20 dark:text-gray-400";
-      default:
-        return "bg-gray-100 text-gray-800 dark:bg-gray-900/20 dark:text-gray-400";
-    }
-  };
 
   if (loading) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="h-8 w-8 animate-spin rounded-full border-4 border-indigo-600 border-t-transparent"></div>
+      <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-background via-background to-muted/20">
+        <div className="text-center space-y-4">
+          <LoadingLines />
+          <p className="text-muted-foreground">Loading sessions...</p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-900 dark:to-gray-800">
+    <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
       <div className="container mx-auto px-4 py-8">
-        <div className="mb-6 flex items-center justify-between">
-          <h1 className="text-3xl font-bold text-gray-900 dark:text-white">Sessions</h1>
-          <div className="flex gap-4">
-            <Link
-              href="/dashboard"
-              className="rounded-lg bg-indigo-600 px-4 py-2 text-white transition-colors hover:bg-indigo-700"
-            >
-              New Session
-            </Link>
-            <button
+        <div className="mb-8 flex items-center justify-between">
+          <div>
+            <h1 className="text-4xl font-bold tracking-tight">Sessions</h1>
+            <p className="mt-2 text-muted-foreground">
+              View and manage your recording sessions
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <Button asChild>
+              <Link href="/dashboard">New Session</Link>
+            </Button>
+            <Button
+              variant="outline"
               onClick={async () => {
                 await fetch("/api/auth/sign-out", { method: "POST" });
                 router.push("/sign-in");
               }}
-              className="rounded-lg bg-white px-4 py-2 text-gray-700 shadow-sm transition-colors hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
             >
               Sign Out
-            </button>
+            </Button>
           </div>
         </div>
 
         {sessions.length === 0 ? (
-          <div className="rounded-2xl bg-white p-8 text-center shadow-xl dark:bg-gray-800">
-            <p className="text-gray-600 dark:text-gray-400">No sessions yet.</p>
-            <Link
-              href="/dashboard"
-              className="mt-4 inline-block rounded-lg bg-indigo-600 px-6 py-3 text-white transition-colors hover:bg-indigo-700"
-            >
-              Start Your First Session
-            </Link>
-          </div>
+          <Card className="text-center">
+            <CardContent className="pt-6">
+              <p className="text-muted-foreground mb-4">No sessions yet.</p>
+              <Button asChild>
+                <Link href="/dashboard">Start Your First Session</Link>
+              </Button>
+            </CardContent>
+          </Card>
         ) : (
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {sessions.map((session) => (
-              <Link
-                key={session.id}
-                href={`/sessions/${session.id}`}
-                className="rounded-2xl bg-white p-6 shadow-xl transition-transform hover:scale-105 dark:bg-gray-800"
-              >
-                <div className="mb-4 flex items-center justify-between">
-                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
-                    {session.title || "Untitled Session"}
-                  </h3>
-                  <span
-                    className={`rounded-full px-2 py-1 text-xs font-medium ${getStatusColor(session.status)}`}
-                  >
-                    {session.status}
-                  </span>
-                </div>
-                <p className="mb-2 text-sm text-gray-600 dark:text-gray-400">
-                  {formatDate(session.createdAt)}
-                </p>
-                <p className="mb-2 text-sm text-gray-600 dark:text-gray-400">
-                  Duration: {formatDuration(session.duration)}
-                </p>
-                {session.transcriptText && (
-                  <p className="line-clamp-2 text-sm text-gray-700 dark:text-gray-300">
-                    {session.transcriptText.substring(0, 100)}
-                    {session.transcriptText.length > 100 ? "..." : ""}
-                  </p>
-                )}
+              <Link key={session.id} href={`/sessions/${session.id}`}>
+                <Card className="h-full transition-all hover:shadow-lg hover:scale-[1.02] cursor-pointer">
+                  <CardHeader>
+                    <div className="flex items-center justify-between">
+                      <CardTitle className="text-lg">
+                        {session.title || "Untitled Session"}
+                      </CardTitle>
+                      <Badge
+                        variant={
+                          session.status === "COMPLETED"
+                            ? "default"
+                            : session.status === "PROCESSING"
+                            ? "secondary"
+                            : "destructive"
+                        }
+                      >
+                        {session.status}
+                      </Badge>
+                    </div>
+                    <CardDescription>
+                      {formatDate(session.createdAt)}
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <p className="text-sm text-muted-foreground mb-2">
+                      Duration: {formatDuration(session.duration)}
+                    </p>
+                    {session.transcriptText && (
+                      <p className="line-clamp-2 text-sm text-muted-foreground">
+                        {session.transcriptText.substring(0, 100)}
+                        {session.transcriptText.length > 100 ? "..." : ""}
+                      </p>
+                    )}
+                  </CardContent>
+                </Card>
               </Link>
             ))}
           </div>
