@@ -12,6 +12,8 @@ const AudioChunkSchema = z.object({
   sessionId: z.string(),
   audioData: z.string(), // Base64 encoded
   mimeType: z.string().optional().default("audio/webm"),
+  audioLevel: z.number().min(0).max(1).optional(),
+  chunkId: z.string().optional(),
 });
 
 const SessionActionSchema = z.object({
@@ -64,12 +66,15 @@ export function setupSocketHandlers(socket: Socket, io: Server): void {
    */
   socket.on("audio-chunk", async (data: unknown) => {
     try {
-      const { sessionId, audioData, mimeType } = AudioChunkSchema.parse(data);
+      const { sessionId, audioData, mimeType, audioLevel, chunkId } = AudioChunkSchema.parse(data);
       const buffer = Buffer.from(audioData, "base64");
-      await audioProcessor.addChunk(sessionId, buffer, mimeType);
+      await audioProcessor.addChunk(sessionId, buffer, mimeType, {
+        audioLevel,
+        chunkId,
+      });
 
       // Emit acknowledgment
-      socket.emit("chunk-received", { sessionId });
+      socket.emit("chunk-received", { sessionId, chunkId });
     } catch (error) {
       console.error("Error processing audio chunk:", error);
       socket.emit("error", { message: "Failed to process audio chunk" });

@@ -4,7 +4,7 @@
  */
 
 const DB_NAME = "ScribeAI_AudioQueue";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = "audioChunks";
 
 interface QueuedChunk {
@@ -14,6 +14,8 @@ interface QueuedChunk {
   mimeType: string;
   timestamp: number;
   retryCount: number;
+  audioLevel?: number | null;
+  chunkId?: string;
 }
 
 /**
@@ -28,10 +30,19 @@ async function openDB(): Promise<IDBDatabase> {
 
     request.onupgradeneeded = (event) => {
       const db = (event.target as IDBOpenDBRequest).result;
+      let store: IDBObjectStore;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
-        const store = db.createObjectStore(STORE_NAME, { keyPath: "id" });
+        store = db.createObjectStore(STORE_NAME, { keyPath: "id" });
         store.createIndex("sessionId", "sessionId", { unique: false });
         store.createIndex("timestamp", "timestamp", { unique: false });
+      } else {
+        store = request.transaction?.objectStore(STORE_NAME)!;
+        if (!store.indexNames.contains("sessionId")) {
+          store.createIndex("sessionId", "sessionId", { unique: false });
+        }
+        if (!store.indexNames.contains("timestamp")) {
+          store.createIndex("timestamp", "timestamp", { unique: false });
+        }
       }
     };
   });
@@ -43,12 +54,19 @@ async function openDB(): Promise<IDBDatabase> {
 export async function queueChunk(
   sessionId: string,
   audioData: string,
-  mimeType: string = "audio/webm"
+  mimeType: string = "audio/webm",
+  metadata?: { audioLevel?: number; chunkId?: string }
 ): Promise<void> {
   try {
     const db = await openDB();
     const transaction = db.transaction([STORE_NAME], "readwrite");
     const store = transaction.objectStore(STORE_NAME);
+
+    const generatedChunkId =
+      (typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : undefined) || `${sessionId}-${Date.now()}-${Math.random()}`;
+    const chunkId = metadata?.chunkId || generatedChunkId;
 
     const chunk: QueuedChunk = {
       id: `${sessionId}-${Date.now()}-${Math.random()}`,
@@ -57,6 +75,8 @@ export async function queueChunk(
       mimeType,
       timestamp: Date.now(),
       retryCount: 0,
+      audioLevel: metadata?.audioLevel ?? null,
+      chunkId,
     };
 
     await new Promise<void>((resolve, reject) => {
@@ -170,4 +190,5 @@ export async function getQueueSize(sessionId: string): Promise<number> {
   const chunks = await getQueuedChunks(sessionId);
   return chunks.length;
 }
+
 

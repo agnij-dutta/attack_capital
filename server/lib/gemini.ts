@@ -200,6 +200,13 @@ export async function transcribeAudio(
 
     // Enhanced prompt for accurate, continuous transcription
     let promptText = "";
+    const baseInstructions = `SYSTEM INSTRUCTION:
+- Transcribe EXACT spoken words with punctuation kept natural.
+- Never invent or summarize content. If you cannot hear new speech, respond with "[silence]".
+- If speech is unclear, respond with "[inaudible]".
+- Format every utterance as "[Speaker 1]: words". Use [Speaker 2], [Speaker 3] only when clearly different voices exist.
+- Do not repeat previous transcript content. Only emit NEW audio from this chunk.
+- Do not describe tones or music unless the speaker explicitly says those words.`;
     
     // Only include context if there's substantial previous speech
     const hasActualSpeech = previousContext && 
@@ -210,13 +217,17 @@ export async function transcribeAudio(
     if (hasActualSpeech) {
       // Include context for continuity - very minimal prompt
       // Put context first, then simple instruction
-      promptText = `Previous transcript:
+      promptText = `${baseInstructions}
+
+Previous transcript (context only, do NOT repeat):
 ${previousContext}
 
-Now transcribe the new audio. Continue from above. Format: [Speaker 1]: new words only.`;
+Now transcribe the new audio. Continue from above and only include newly spoken words.`;
     } else {
       // First chunk - very minimal prompt
-      promptText = `Transcribe this audio. Format: [Speaker 1]: words spoken.`;
+      promptText = `${baseInstructions}
+
+Transcribe this audio now.`;
     }
 
     // Use gemini-2.5-flash for audio transcription (most reliable)
@@ -471,6 +482,17 @@ Now transcribe the new audio. Continue from above. Format: [Speaker 1]: new word
           break;
         }
       }
+    }
+
+    const nonVerbalOnly = cleanedText
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0)
+      .every(line => /\[Speaker \d+\]:\s*\[[^\]]+\]/i.test(line));
+
+    if (nonVerbalOnly && cleanedText.length < 200) {
+      console.warn("[Gemini] Response only contains non-verbal descriptions. Treating as silence.");
+      return "[silence]";
     }
     
     // Final validation: check speaker count for logging
