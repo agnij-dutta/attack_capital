@@ -44,6 +44,53 @@ export function useAudioRecorder(
   const socketRef = useRef<Socket | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const sessionIdRef = useRef<string | null>(null);
+  const audioLevelRef = useRef(0);
+  const audioMonitorRef = useRef<{
+    audioContext: AudioContext;
+    rafId: number | null;
+  } | null>(null);
+
+  const stopAudioLevelMonitor = useCallback(() => {
+    if (audioMonitorRef.current) {
+      if (audioMonitorRef.current.rafId !== null) {
+        cancelAnimationFrame(audioMonitorRef.current.rafId);
+      }
+      audioMonitorRef.current.audioContext.close();
+      audioMonitorRef.current = null;
+    }
+  }, []);
+
+  const startAudioLevelMonitor = useCallback(
+    (stream: MediaStream) => {
+      try {
+        stopAudioLevelMonitor();
+        const audioContext = new AudioContext({ sampleRate: 48000 });
+        const source = audioContext.createMediaStreamSource(stream);
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.8;
+        source.connect(analyser);
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        const updateLevel = () => {
+          analyser.getByteFrequencyData(dataArray);
+          const average =
+            dataArray.reduce((sum, value) => sum + value, 0) /
+            dataArray.length;
+          audioLevelRef.current = Number(Math.min(Math.max(average / 255, 0), 1).toFixed(4));
+          audioMonitorRef.current!.rafId = requestAnimationFrame(updateLevel);
+        };
+
+        audioMonitorRef.current = {
+          audioContext,
+          rafId: requestAnimationFrame(updateLevel),
+        };
+      } catch (monitorError) {
+        console.warn("[AudioRecorder] Failed to start audio level monitor:", monitorError);
+      }
+    },
+    [stopAudioLevelMonitor]
+  );
 
   /**
    * Initialize WebSocket connection
@@ -141,10 +188,13 @@ export function useAudioRecorder(
         }
 
         try {
+          const chunkId = chunk.chunkId || chunk.id;
           socket.emit("audio-chunk", {
             sessionId: chunk.sessionId,
             audioData: chunk.audioData,
             mimeType: chunk.mimeType,
+            audioLevel: chunk.audioLevel ?? undefined,
+            chunkId,
           });
 
           // Wait for acknowledgment
@@ -152,14 +202,21 @@ export function useAudioRecorder(
             const timeout = setTimeout(async () => {
               // No ack received, increment retry count
               await incrementRetryCount(chunk.id);
+              socket.off("chunk-received", ackHandler);
               resolve();
             }, 2000);
 
-            socket.once("chunk-received", async () => {
+            const ackHandler = async (payload?: { chunkId?: string }) => {
+              if (!payload?.chunkId || payload.chunkId !== chunkId) {
+                return;
+              }
+              socket.off("chunk-received", ackHandler);
               clearTimeout(timeout);
               await removeChunk(chunk.id);
               resolve();
-            });
+            };
+
+            socket.on("chunk-received", ackHandler);
           });
 
           // Small delay between chunks
@@ -366,6 +423,7 @@ export function useAudioRecorder(
         }
 
         streamRef.current = stream;
+        startAudioLevelMonitor(stream);
 
         // Verify audio tracks are active
         const audioTracks = stream.getAudioTracks();
@@ -453,6 +511,15 @@ export function useAudioRecorder(
                 return;
               }
 
+              const audioLevel = Number(
+                Math.min(Math.max(audioLevelRef.current || 0, 0), 1).toFixed(4)
+              );
+              const chunkId =
+                (typeof crypto !== "undefined" && crypto.randomUUID
+                  ? crypto.randomUUID()
+                  : null) ||
+                `chunk-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
               // Try to send immediately if connected
               if (socketRef.current?.connected) {
                 try {
@@ -461,27 +528,35 @@ export function useAudioRecorder(
                     sessionId: currentSessionId,
                     audioData: base64Audio,
                     mimeType,
+                    audioLevel,
+                    chunkId,
                   });
                   
                   // Wait for acknowledgment (chunk-received event)
                   // If no ack within 2s, queue it
+                  const ackHandler = (payload?: { chunkId?: string }) => {
+                    if (!payload?.chunkId || payload.chunkId !== chunkId) {
+                      return;
+                    }
+                    socketRef.current?.off("chunk-received", ackHandler);
+                    clearTimeout(ackTimeout);
+                  };
+                  
                   const ackTimeout = setTimeout(async () => {
                     console.warn("[AudioRecorder] No acknowledgment received, queueing chunk");
-                    await queueChunk(currentSessionId, base64Audio, mimeType);
+                    socketRef.current?.off("chunk-received", ackHandler);
+                    await queueChunk(currentSessionId, base64Audio, mimeType, { audioLevel, chunkId });
                   }, 2000);
                   
-                  // Remove timeout on ack (handled in socket listener)
-                  socketRef.current.once("chunk-received", () => {
-                    clearTimeout(ackTimeout);
-                  });
+                  socketRef.current.on("chunk-received", ackHandler);
                 } catch (error) {
                   console.error("[AudioRecorder] Error sending chunk, queueing:", error);
-                  await queueChunk(currentSessionId, base64Audio, mimeType);
+                  await queueChunk(currentSessionId, base64Audio, mimeType, { audioLevel, chunkId });
                 }
               } else {
                 // Not connected - queue the chunk
                 console.log("[AudioRecorder] Not connected, queueing chunk for later");
-                await queueChunk(currentSessionId, base64Audio, mimeType);
+                await queueChunk(currentSessionId, base64Audio, mimeType, { audioLevel, chunkId });
               }
             };
             reader.onerror = (error) => {
@@ -524,7 +599,7 @@ export function useAudioRecorder(
         }
       }
     },
-    [userId, initializeSocket]
+    [userId, initializeSocket, startAudioLevelMonitor]
   );
 
   /**
@@ -567,6 +642,7 @@ export function useAudioRecorder(
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    stopAudioLevelMonitor();
 
     const currentSessionId = sessionIdRef.current;
     
@@ -585,7 +661,7 @@ export function useAudioRecorder(
         await clearSessionQueue(currentSessionId);
       }, 5000);
     }
-  }, [processQueuedChunks]);
+  }, [processQueuedChunks, stopAudioLevelMonitor]);
 
   /**
    * Cancel recording
@@ -617,6 +693,7 @@ export function useAudioRecorder(
       });
       streamRef.current = null;
     }
+    stopAudioLevelMonitor();
 
     const currentSessionId = sessionIdRef.current;
     
@@ -648,7 +725,7 @@ export function useAudioRecorder(
     setError(null);
     
     console.log("[AudioRecorder] Recording cancelled and state reset");
-  }, []);
+  }, [stopAudioLevelMonitor]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -662,8 +739,9 @@ export function useAudioRecorder(
       if (mediaRecorderRef.current) {
         mediaRecorderRef.current.stop();
       }
+      stopAudioLevelMonitor();
     };
-  }, []);
+  }, [stopAudioLevelMonitor]);
 
   return {
     isRecording: state === "recording",

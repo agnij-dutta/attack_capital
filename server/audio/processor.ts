@@ -1,15 +1,20 @@
 import { PrismaClient, SessionStatus } from "@prisma/client";
 import { transcribeAudio, generateSummary } from "../lib/gemini";
 import { writeFile, mkdir, rm, readdir, stat, readFile, mkdtemp, unlink } from "fs/promises";
-import { join } from "path";
+import { join, resolve, dirname } from "path";
 import { existsSync } from "fs";
+import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import { Server as SocketIOServer } from "socket.io";
 import { tmpdir } from "os";
 import { exec } from "child_process";
 import { promisify } from "util";
+import { createHash } from "crypto";
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const prisma = new PrismaClient();
 const CHUNK_DURATION_MS = 30000; // 30 seconds as per PRD requirement - longer chunks provide better context
@@ -17,6 +22,11 @@ const MIN_CHUNK_SIZE_BYTES = 10000; // Minimum chunk size to process (10KB) - la
 const MAX_BUFFER_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
 
 const execAsync = promisify(exec);
+const SAVE_MP3_DEBUG =
+  process.env.SAVE_MP3_DEBUG !== undefined
+    ? process.env.SAVE_MP3_DEBUG === "true"
+    : true;
+const AUDIO_SESSIONS_ROOT = resolve(__dirname, "sessions");
 
 // Store socket.io instance for real-time updates
 let ioInstance: SocketIOServer | null = null;
@@ -34,6 +44,15 @@ export class AudioProcessor {
   private sessionStartTimes: Map<string, number> = new Map();
   private totalSizes: Map<string, number> = new Map();
   private chunkFileQueues: Map<string, string[]> = new Map();
+  private chunkMetadata: Map<
+    string,
+    { audioLevel?: number; chunkId?: string; size: number }[]
+  > = new Map();
+  private lastChunkHashes: Map<string, string> = new Map();
+
+  private getSessionDir(sessionId: string): string {
+    return join(AUDIO_SESSIONS_ROOT, sessionId);
+  }
 
   /**
    * Initialize a new recording session
@@ -43,6 +62,8 @@ export class AudioProcessor {
     this.sessionStartTimes.set(sessionId, Date.now());
     this.totalSizes.set(sessionId, 0);
     this.chunkFileQueues.set(sessionId, []);
+    this.chunkMetadata.set(sessionId, []);
+    this.lastChunkHashes.delete(sessionId);
 
     // Create session in database
     await prisma.recordingSession.create({
@@ -61,7 +82,8 @@ export class AudioProcessor {
   async addChunk(
     sessionId: string,
     audioData: Buffer,
-    mimeType: string = "audio/webm"
+    mimeType: string = "audio/webm",
+    metadata?: { audioLevel?: number; chunkId?: string }
   ): Promise<void> {
     // Validate chunk size - skip very small chunks that are likely empty/silent
     if (audioData.length < 1024) {
@@ -83,6 +105,13 @@ export class AudioProcessor {
     bufferList.push(audioData);
     this.buffers.set(sessionId, bufferList);
     this.totalSizes.set(sessionId, newSize);
+    const metadataQueue = this.chunkMetadata.get(sessionId) || [];
+    metadataQueue.push({
+      audioLevel: metadata?.audioLevel,
+      chunkId: metadata?.chunkId,
+      size: audioData.length,
+    });
+    this.chunkMetadata.set(sessionId, metadataQueue);
 
     // Save chunk to disk for persistence
     await this.saveChunkToDisk(sessionId, audioData, mimeType);
@@ -112,7 +141,7 @@ export class AudioProcessor {
   /**
    * Process accumulated audio chunk and send to Gemini
    */
-  private async processChunk(sessionId: string, mimeType: string): Promise<void> {
+  private async processChunk(sessionId: string, mimeType: string): Promise<string | void> {
     const bufferList = this.buffers.get(sessionId);
     if (!bufferList || bufferList.length === 0) {
       // Don't log if session is already completed/cancelled (expected behavior)
@@ -132,6 +161,15 @@ export class AudioProcessor {
     // Combine buffers into single chunk
     const combinedBuffer = Buffer.concat(bufferList);
     const totalSize = combinedBuffer.length;
+
+    const metadataQueue = this.chunkMetadata.get(sessionId) || [];
+    const currentMetadata = metadataQueue.splice(0, bufferList.length);
+    this.chunkMetadata.set(sessionId, metadataQueue);
+    const averageAudioLevel =
+      currentMetadata.length > 0
+        ? currentMetadata.reduce((sum, meta) => sum + (meta.audioLevel ?? 0), 0) /
+          currentMetadata.length
+        : null;
     
       // Skip processing if combined chunk is too small (likely silence/empty)
       // Increased threshold to ensure we have enough audio data for accurate transcription
@@ -139,6 +177,24 @@ export class AudioProcessor {
         console.warn(`[AudioProcessor] Combined chunk too small for ${sessionId}: ${totalSize} bytes (likely silence, skipping transcription)`);
         // Clear buffers but don't process
         this.buffers.set(sessionId, []);
+        this.chunkMetadata.set(sessionId, []);
+        return;
+      }
+
+      if (averageAudioLevel !== null) {
+        console.log(`[AudioProcessor] Average audio level for ${sessionId}: ${(averageAudioLevel * 100).toFixed(1)}%`);
+      }
+
+      if (
+        averageAudioLevel !== null &&
+        averageAudioLevel < 0.02 &&
+        totalSize < MIN_CHUNK_SIZE_BYTES * 4
+      ) {
+        console.warn(
+          `[AudioProcessor] Low audio energy detected (${averageAudioLevel}), skipping chunk for ${sessionId}`
+        );
+        this.buffers.set(sessionId, []);
+        this.chunkMetadata.set(sessionId, []);
         return;
       }
       
@@ -150,22 +206,49 @@ export class AudioProcessor {
     let finalMimeType = mimeType;
     console.log(`[AudioProcessor] Processing chunk for ${sessionId}: ${totalSize} bytes (${bufferList.length} sub-chunks), base64 length: ${base64Audio.length}`);
 
-    // Convert using disk chunks to ensure proper container (prevents EBML header errors)
+    const chunkHash = createHash("sha256").update(combinedBuffer).digest("hex");
+    const previousHash = this.lastChunkHashes.get(sessionId);
+    if (previousHash && previousHash === chunkHash) {
+      console.warn(`[AudioProcessor] Duplicate chunk detected for ${sessionId} (hash=${chunkHash}). Skipping transcription.`);
+      this.buffers.set(sessionId, []);
+      this.chunkMetadata.set(sessionId, []);
+      return;
+    }
+    this.lastChunkHashes.set(sessionId, chunkHash);
+
+    // Use chunk files from disk with FFmpeg concat demuxer for proper WebM fragment handling
+    // WebM fragments need to be concatenated properly, not just combined as raw bytes
     const chunkFiles = this.getChunkFilesForProcessing(sessionId, bufferList.length);
-    if (chunkFiles.length > 0) {
-      if (chunkFiles.length === bufferList.length) {
+    if (chunkFiles.length > 0 && chunkFiles.length === bufferList.length) {
+      try {
+        const conversionResult = await this.convertChunkFilesToMp3(sessionId, chunkFiles);
+        base64Audio = conversionResult.base64Audio;
+        finalMimeType = conversionResult.mimeType;
+        console.log(`[AudioProcessor] Successfully converted ${chunkFiles.length} chunk files to ${finalMimeType} for session ${sessionId}`);
+      } catch (conversionError) {
+        console.error(`[AudioProcessor] Failed to convert chunk files for session ${sessionId}, trying combined buffer:`, conversionError);
+        this.restoreChunkFiles(sessionId, chunkFiles);
+        // Fall back to combined buffer conversion
         try {
-          const conversionResult = await this.convertChunksToMp3(sessionId, chunkFiles);
+          const conversionResult = await this.convertBufferToMp3(combinedBuffer, mimeType, sessionId);
           base64Audio = conversionResult.base64Audio;
           finalMimeType = conversionResult.mimeType;
-          console.log(`[AudioProcessor] Successfully converted ${chunkFiles.length} chunk files to ${finalMimeType} for session ${sessionId}`);
-        } catch (conversionError) {
-          console.error(`[AudioProcessor] Failed to convert chunk files for session ${sessionId}, falling back to in-memory buffer:`, conversionError);
-          this.restoreChunkFiles(sessionId, chunkFiles);
+          console.log(`[AudioProcessor] Successfully converted combined buffer (${totalSize} bytes) to ${finalMimeType} for session ${sessionId}`);
+        } catch (bufferError) {
+          console.error(`[AudioProcessor] Both conversion methods failed for session ${sessionId}, using original format:`, bufferError);
+          // Final fallback - use original format
         }
-      } else {
-        console.warn(`[AudioProcessor] Chunk file count mismatch for session ${sessionId}. Expected ${bufferList.length}, got ${chunkFiles.length}. Restoring files and falling back to in-memory buffer.`);
-        this.restoreChunkFiles(sessionId, chunkFiles);
+      }
+    } else {
+      // No chunk files available, use combined buffer
+      try {
+        const conversionResult = await this.convertBufferToMp3(combinedBuffer, mimeType, sessionId);
+        base64Audio = conversionResult.base64Audio;
+        finalMimeType = conversionResult.mimeType;
+        console.log(`[AudioProcessor] Successfully converted combined buffer (${totalSize} bytes) to ${finalMimeType} for session ${sessionId}`);
+      } catch (conversionError) {
+        console.error(`[AudioProcessor] Failed to convert combined buffer for session ${sessionId}, using original format:`, conversionError);
+        // Fall back to original format - let Gemini try to handle it
       }
     }
 
@@ -222,6 +305,7 @@ export class AudioProcessor {
           chunkIndex: session.chunks.length,
           text: transcript,
           timestamp: new Date(),
+          confidence: averageAudioLevel ?? undefined,
         },
       });
 
@@ -243,6 +327,7 @@ export class AudioProcessor {
 
       // Clear processed buffers
       this.buffers.set(sessionId, []);
+      this.chunkMetadata.set(sessionId, []);
 
       return transcript;
     } catch (error) {
@@ -286,43 +371,182 @@ export class AudioProcessor {
     return "webm";
   }
 
-  private async convertChunksToMp3(sessionId: string, chunkFiles: string[]): Promise<{ base64Audio: string; mimeType: string }> {
+  /**
+   * Convert chunk files from disk to MP3 using FFmpeg concat filter
+   * This properly handles WebM fragments by extracting audio streams and concatenating them
+   */
+  private async convertChunkFilesToMp3(
+    sessionId: string,
+    chunkFiles: string[]
+  ): Promise<{ base64Audio: string; mimeType: string }> {
     if (chunkFiles.length === 0) {
       throw new Error("No chunk files provided for conversion");
     }
 
     const tempDir = await mkdtemp(join(tmpdir(), `session-${sessionId}-`));
-    const concatListPath = join(tempDir, "chunks.txt");
-    const concatContent = chunkFiles
-      .map((filePath) => `file '${filePath.replace(/'/g, "'\\''")}'`)
-      .join("\n");
-    await writeFile(concatListPath, concatContent);
-
     const outputFile = join(tempDir, `combined-${Date.now()}.mp3`);
-    const ffmpegCommand = `ffmpeg -y -loglevel error -f concat -safe 0 -i "${concatListPath}" -acodec libmp3lame -ar 16000 -ac 1 -b:a 64k "${outputFile}"`;
+    
+    // Build FFmpeg command with multiple inputs and concat filter
+    // This approach handles fragmented WebM better than concat demuxer
+    const inputArgs = chunkFiles.map((file) => `-i "${file}"`).join(" ");
+    
+    // Build concat filter: [0:a] [1:a] [2:a] ... concat=n=N:v=0:a=1 [outa]
+    // This extracts audio from each input and concatenates them
+    const audioInputs = chunkFiles.map((_, i) => `[${i}:a]`).join(" ");
+    const concatFilter = `${audioInputs} concat=n=${chunkFiles.length}:v=0:a=1 [outa]`;
+    
+    // Use -err_detect ignore_err and -fflags +genpts to handle fragmented streams
+    const ffmpegCommand = `ffmpeg -y -loglevel warning -err_detect ignore_err -fflags +genpts ${inputArgs} -filter_complex "${concatFilter}" -map "[outa]" -acodec libmp3lame -ar 16000 -ac 1 -b:a 64k -f mp3 "${outputFile}"`;
 
     try {
-      await execAsync(ffmpegCommand, {
+      const { stdout, stderr } = await execAsync(ffmpegCommand, {
         maxBuffer: 10 * 1024 * 1024,
         timeout: 60000,
       });
-      const mp3Buffer = await readFile(outputFile);
-      if (!mp3Buffer || mp3Buffer.length === 0) {
-        throw new Error("Converted MP3 is empty");
+
+      // Verify output file
+      if (!existsSync(outputFile)) {
+        throw new Error("FFmpeg concat failed - output file not created");
       }
+
+      const stats = await stat(outputFile);
+      if (stats.size === 0) {
+        throw new Error("FFmpeg concat produced empty file");
+      }
+
+      const mp3Buffer = await readFile(outputFile);
+      console.log(`[AudioProcessor] Combined ${chunkFiles.length} chunks into ${stats.size} byte MP3 (${(stats.size / 1024).toFixed(1)} KB)`);
+
+      // Verify duration using ffprobe if available
+      try {
+        const { stdout: durationOut } = await execAsync(
+          `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
+          {
+            maxBuffer: 1024 * 1024,
+            timeout: 10000,
+          }
+        );
+        const duration = parseFloat(durationOut.trim());
+        console.log(`[AudioProcessor] MP3 duration: ${duration.toFixed(2)} seconds (expected ~30s)`);
+        if (duration < 5) {
+          console.warn(
+            `[AudioProcessor] ⚠️ WARNING: MP3 is only ${duration.toFixed(2)}s, expected ~30s. Audio may be truncated.`
+          );
+        } else if (duration >= 25 && duration <= 35) {
+          console.log(`[AudioProcessor] ✅ MP3 duration is correct: ${duration.toFixed(2)}s`);
+        }
+      } catch (probeError) {
+        // ffprobe not available or failed, continue anyway
+        console.warn(`[AudioProcessor] Could not verify MP3 duration: ${probeError}`);
+      }
+
       const base64Audio = mp3Buffer.toString("base64");
+
+      if (SAVE_MP3_DEBUG) {
+        await this.saveDebugMp3(sessionId, mp3Buffer);
+      }
 
       // Remove processed chunk files to keep disk usage low
       await Promise.all(chunkFiles.map((filePath) => unlink(filePath).catch(() => {})));
 
       return { base64Audio, mimeType: "audio/mp3" };
+    } catch (error: any) {
+      console.error(`[AudioProcessor] FFmpeg concat filter failed:`, error.message?.substring(0, 300));
+      // Log stderr if available for debugging
+      if (error.stderr) {
+        console.error(`[AudioProcessor] FFmpeg stderr:`, error.stderr.substring(0, 500));
+      }
+      throw error;
     } finally {
+      // Clean up temp directory (but keep debug MP3 if saved)
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /**
+   * Convert combined in-memory audio buffer directly to MP3
+   * Fallback method when chunk files are not available
+   */
+  private async convertBufferToMp3(
+    audioBuffer: Buffer,
+    inputMimeType: string,
+    sessionId: string
+  ): Promise<{ base64Audio: string; mimeType: string }> {
+    const tempDir = await mkdtemp(join(tmpdir(), `session-${sessionId}-`));
+    const inputFile = join(tempDir, `input-${Date.now()}.${this.getExtensionForMime(inputMimeType)}`);
+    const outputFile = join(tempDir, `output-${Date.now()}.mp3`);
+
+    try {
+      // Write combined buffer to temp file
+      await writeFile(inputFile, audioBuffer);
+      console.log(`[AudioProcessor] Wrote ${audioBuffer.length} bytes to temp file for conversion`);
+
+      // Convert to MP3 using FFmpeg
+      // Use -err_detect ignore_err to handle incomplete WebM headers gracefully
+      // Use -fflags +genpts to generate timestamps for streamed content
+      const ffmpegCommand = `ffmpeg -y -loglevel warning -err_detect ignore_err -fflags +genpts -i "${inputFile}" -acodec libmp3lame -ar 16000 -ac 1 -b:a 64k -f mp3 "${outputFile}"`;
+
+      const { stdout, stderr } = await execAsync(ffmpegCommand, {
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 60000,
+      });
+
+      // Verify output file
+      if (!existsSync(outputFile)) {
+        throw new Error("FFmpeg conversion failed - output file not created");
+      }
+
+      const stats = await stat(outputFile);
+      if (stats.size === 0) {
+        throw new Error("FFmpeg conversion produced empty file");
+      }
+
+      const mp3Buffer = await readFile(outputFile);
+      console.log(`[AudioProcessor] Converted ${audioBuffer.length} bytes to ${stats.size} byte MP3 (${(stats.size / 1024).toFixed(1)} KB)`);
+
+      // Verify duration using ffprobe if available
+      try {
+        const { stdout: durationOut } = await execAsync(
+          `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
+          {
+            maxBuffer: 1024 * 1024,
+            timeout: 10000,
+          }
+        );
+        const duration = parseFloat(durationOut.trim());
+        console.log(`[AudioProcessor] MP3 duration: ${duration.toFixed(2)} seconds (expected ~30s)`);
+        if (duration < 5) {
+          console.warn(
+            `[AudioProcessor] ⚠️ WARNING: MP3 is only ${duration.toFixed(2)}s, expected ~30s. Audio may be truncated.`
+          );
+        } else if (duration >= 25 && duration <= 35) {
+          console.log(`[AudioProcessor] ✅ MP3 duration is correct: ${duration.toFixed(2)}s`);
+        }
+      } catch (probeError) {
+        // ffprobe not available or failed, continue anyway
+        console.warn(`[AudioProcessor] Could not verify MP3 duration: ${probeError}`);
+      }
+
+      const base64Audio = mp3Buffer.toString("base64");
+
+      if (SAVE_MP3_DEBUG) {
+        await this.saveDebugMp3(sessionId, mp3Buffer);
+      }
+
+      return { base64Audio, mimeType: "audio/mp3" };
+    } catch (error: any) {
+      console.error(`[AudioProcessor] FFmpeg conversion failed:`, error.message?.substring(0, 300));
+      throw error;
+    } finally {
+      // Clean up temp files
+      await unlink(inputFile).catch(() => {});
+      await unlink(outputFile).catch(() => {});
       await rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
   private async saveChunkToDisk(sessionId: string, audioData: Buffer, mimeType: string = "audio/webm"): Promise<void> {
-    const audioDir = join(process.cwd(), "server", "audio", "sessions", sessionId);
+    const audioDir = this.getSessionDir(sessionId);
     if (!existsSync(audioDir)) {
       await mkdir(audioDir, { recursive: true });
     }
@@ -335,6 +559,26 @@ export class AudioProcessor {
     const queue = this.chunkFileQueues.get(sessionId) || [];
     queue.push(filePath);
     this.chunkFileQueues.set(sessionId, queue);
+  }
+
+  private async saveDebugMp3(sessionId: string, mp3Buffer: Buffer): Promise<void> {
+    try {
+      const sessionDir = this.getSessionDir(sessionId);
+      if (!existsSync(sessionDir)) {
+        await mkdir(sessionDir, { recursive: true });
+      }
+
+      const debugDir = join(sessionDir, "debug");
+      if (!existsSync(debugDir)) {
+        await mkdir(debugDir, { recursive: true });
+      }
+
+      const filePath = join(debugDir, `combined-${Date.now()}.mp3`);
+      await writeFile(filePath, mp3Buffer);
+      console.log(`[AudioProcessor] Saved debug MP3 for ${sessionId}: ${filePath}`);
+    } catch (error) {
+      console.error(`[AudioProcessor] Failed to save debug MP3 for ${sessionId}:`, error);
+    }
   }
 
   /**
@@ -359,6 +603,8 @@ export class AudioProcessor {
     this.sessionStartTimes.delete(sessionId);
     this.totalSizes.delete(sessionId);
     this.chunkFileQueues.delete(sessionId);
+    this.chunkMetadata.delete(sessionId);
+    this.lastChunkHashes.delete(sessionId);
 
     // Update session status to processing
     await prisma.recordingSession.update({
@@ -473,6 +719,8 @@ export class AudioProcessor {
     this.sessionStartTimes.delete(sessionId);
     this.totalSizes.delete(sessionId);
     this.chunkFileQueues.delete(sessionId);
+    this.chunkMetadata.delete(sessionId);
+    this.lastChunkHashes.delete(sessionId);
 
     // Clean up audio files
     await this.cleanupAudioFiles(sessionId);
@@ -491,15 +739,48 @@ export class AudioProcessor {
   
   /**
    * Clean up audio files for a session
+   * Preserves debug MP3s if SAVE_MP3_DEBUG is enabled
    */
   private async cleanupAudioFiles(sessionId: string): Promise<void> {
     try {
-      const audioDir = join(process.cwd(), "server", "audio", "sessions", sessionId);
+      const audioDir = this.getSessionDir(sessionId);
       if (existsSync(audioDir)) {
+        // If debug mode is enabled, preserve debug MP3s by moving them to a persistent location
+        if (SAVE_MP3_DEBUG) {
+          const debugDir = join(audioDir, "debug");
+          if (existsSync(debugDir)) {
+            const debugFiles = await readdir(debugDir);
+            if (debugFiles.length > 0) {
+              // Create a persistent debug directory outside the session folder
+              const persistentDebugDir = join(AUDIO_SESSIONS_ROOT, "..", "debug_mp3s");
+              if (!existsSync(persistentDebugDir)) {
+                await mkdir(persistentDebugDir, { recursive: true });
+              }
+              
+              // Move debug MP3s to persistent location
+              for (const file of debugFiles) {
+                if (file.endsWith(".mp3")) {
+                  const sourcePath = join(debugDir, file);
+                  const destPath = join(persistentDebugDir, `${sessionId}-${file}`);
+                  try {
+                    await readFile(sourcePath).then(data => writeFile(destPath, data));
+                    console.log(`[AudioProcessor] Preserved debug MP3: ${destPath}`);
+                  } catch (error) {
+                    console.error(`[AudioProcessor] Failed to preserve debug MP3 ${file}:`, error);
+                  }
+                }
+              }
+            }
+          }
+        }
+        
+        // Now remove the session directory (debug files already preserved if needed)
         await rm(audioDir, { recursive: true, force: true });
         console.log(`[AudioProcessor] Cleaned up audio files for session ${sessionId}`);
       }
       this.chunkFileQueues.delete(sessionId);
+      this.chunkMetadata.delete(sessionId);
+      this.lastChunkHashes.delete(sessionId);
     } catch (error) {
       console.error(`[AudioProcessor] Error cleaning up audio files for ${sessionId}:`, error);
     }
@@ -511,7 +792,7 @@ export class AudioProcessor {
    */
   async resumeInterruptedSessions(): Promise<void> {
     try {
-      const sessionsDir = join(process.cwd(), "server", "audio", "sessions");
+      const sessionsDir = AUDIO_SESSIONS_ROOT;
       if (!existsSync(sessionsDir)) {
         console.log("[AudioProcessor] No sessions directory found, nothing to resume");
         return;
@@ -524,7 +805,7 @@ export class AudioProcessor {
         if (!dir.isDirectory()) continue;
 
         const sessionId = dir.name;
-        const sessionDir = join(sessionsDir, sessionId);
+        const sessionDir = this.getSessionDir(sessionId);
 
         try {
           // Check if session exists in database and is still active
@@ -575,6 +856,10 @@ export class AudioProcessor {
           this.totalSizes.set(sessionId, totalSize);
           this.sessionStartTimes.set(sessionId, new Date(session.createdAt).getTime());
           this.chunkFileQueues.set(sessionId, chunkFilePaths);
+          this.chunkMetadata.set(
+            sessionId,
+            chunkFilePaths.map(() => ({ size: 0 }))
+          );
 
           // If session was PROCESSING, continue processing
           if (session.status === "PROCESSING") {
@@ -602,7 +887,7 @@ export class AudioProcessor {
    */
   async cleanupOldAudioFiles(): Promise<void> {
     try {
-      const sessionsDir = join(process.cwd(), "server", "audio", "sessions");
+      const sessionsDir = AUDIO_SESSIONS_ROOT;
       if (!existsSync(sessionsDir)) {
         return;
       }

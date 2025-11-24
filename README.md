@@ -11,6 +11,8 @@ A full-stack Next.js application for real-time audio transcription and meeting s
 - **Session Management**: View, search, and export past sessions
 - **Resilient Architecture**: Handles network drops, buffer overflows, and device interruptions
 - **Long-duration Support**: Optimized for sessions up to 1+ hours with chunked processing
+- **Signal-Aware Capture**: Each chunk carries audio energy telemetry so the server can ignore silent/empty data and track confidence
+- **Deterministic Audio Pipes**: Chunks are persisted on disk, hashed, stitched via FFmpeg, and the final MP3 is saved for debugging
 
 ## Tech Stack
 
@@ -73,6 +75,9 @@ BETTER_AUTH_URL="http://localhost:3000"
 
 # Gemini API
 GEMINI_API_KEY="your-gemini-api-key-here"
+
+# Audio Debugging
+SAVE_MP3_DEBUG="true"
 
 # WebSocket Server
 WEBSOCKET_URL="http://localhost:4000"
@@ -243,7 +248,7 @@ This architecture scales horizontally by running multiple WebSocket server insta
 
 **Client → Server:**
 - `start-recording` - Initialize new recording session
-- `audio-chunk` - Send audio chunk
+- `audio-chunk` - Send audio chunk (`{ sessionId, audioData, mimeType, audioLevel, chunkId }`)
 - `pause-recording` - Pause recording
 - `resume-recording` - Resume recording
 - `stop-recording` - Stop and process recording
@@ -251,12 +256,20 @@ This architecture scales horizontally by running multiple WebSocket server insta
 
 **Server → Client:**
 - `recording-started` - Recording initialized
-- `chunk-received` - Audio chunk acknowledged
+- `chunk-received` - Audio chunk acknowledged (`{ sessionId, chunkId }`)
 - `recording-paused` - Recording paused
 - `recording-resumed` - Recording resumed
 - `status-update` - Status change notification
 - `recording-completed` - Recording finished with transcript and summary
 - `error` - Error occurred
+
+## Audio Fidelity & Debugging
+
+- **Per-chunk audio energy**: The browser continuously samples RMS levels (for mic and tab capture) and ships the normalized value with each chunk. The server skips clearly silent chunks and stores the value as `confidence` on every `TranscriptChunk`.
+- **Deterministic stitching**: The Socket.io server persists every raw chunk, replays them through FFmpeg’s concat demuxer, and hashes the combined buffer. Duplicate hashes are dropped before hitting Gemini which removes “stuck” transcripts.
+- **Automatic MP3 snapshots**: When `SAVE_MP3_DEBUG=true` (default in development) the stitched MP3 is preserved under `server/audio/sessions/<sessionId>/debug/`. This is the exact audio Gemini heard, so QA can replay mis-transcribed chunks instantly.
+- **Stricter prompting & hygiene**: Gemini now receives a consistent “system” preamble, explicit continuity instructions, and additional post-processing removes non-verbal placeholders (e.g. `[Speaker 1]: [High-pitched tone]`) instead of surfacing them as text.
+- **Chunk metadata everywhere**: Each `audio-chunk` message carries a deterministic `chunkId`, travels through the IndexedDB queue, and is acknowledged by the server so we never drop a chunk silently.
 
 ## Development
 
