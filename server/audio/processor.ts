@@ -7,7 +7,7 @@ import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 import { Server as SocketIOServer } from "socket.io";
 import { tmpdir } from "os";
-import { exec } from "child_process";
+import { exec, spawn } from "child_process";
 import { promisify } from "util";
 import { createHash } from "crypto";
 
@@ -216,40 +216,18 @@ export class AudioProcessor {
     }
     this.lastChunkHashes.set(sessionId, chunkHash);
 
-    // Use chunk files from disk with FFmpeg concat demuxer for proper WebM fragment handling
-    // WebM fragments need to be concatenated properly, not just combined as raw bytes
-    const chunkFiles = this.getChunkFilesForProcessing(sessionId, bufferList.length);
-    if (chunkFiles.length > 0 && chunkFiles.length === bufferList.length) {
-      try {
-        const conversionResult = await this.convertChunkFilesToMp3(sessionId, chunkFiles);
-        base64Audio = conversionResult.base64Audio;
-        finalMimeType = conversionResult.mimeType;
-        console.log(`[AudioProcessor] Successfully converted ${chunkFiles.length} chunk files to ${finalMimeType} for session ${sessionId}`);
-      } catch (conversionError) {
-        console.error(`[AudioProcessor] Failed to convert chunk files for session ${sessionId}, trying combined buffer:`, conversionError);
-        this.restoreChunkFiles(sessionId, chunkFiles);
-        // Fall back to combined buffer conversion
-        try {
-          const conversionResult = await this.convertBufferToMp3(combinedBuffer, mimeType, sessionId);
-          base64Audio = conversionResult.base64Audio;
-          finalMimeType = conversionResult.mimeType;
-          console.log(`[AudioProcessor] Successfully converted combined buffer (${totalSize} bytes) to ${finalMimeType} for session ${sessionId}`);
-        } catch (bufferError) {
-          console.error(`[AudioProcessor] Both conversion methods failed for session ${sessionId}, using original format:`, bufferError);
-          // Final fallback - use original format
-        }
-      }
-    } else {
-      // No chunk files available, use combined buffer
-      try {
-        const conversionResult = await this.convertBufferToMp3(combinedBuffer, mimeType, sessionId);
-        base64Audio = conversionResult.base64Audio;
-        finalMimeType = conversionResult.mimeType;
-        console.log(`[AudioProcessor] Successfully converted combined buffer (${totalSize} bytes) to ${finalMimeType} for session ${sessionId}`);
-      } catch (conversionError) {
-        console.error(`[AudioProcessor] Failed to convert combined buffer for session ${sessionId}, using original format:`, conversionError);
-        // Fall back to original format - let Gemini try to handle it
-      }
+    // Use combined buffer with pipe input to FFmpeg
+    // This handles fragmented WebM better by streaming the data directly
+    // The first chunk has a complete header, subsequent chunks are fragments
+    // FFmpeg can handle this when we pipe the combined data
+    try {
+      const conversionResult = await this.convertBufferToMp3WithPipe(combinedBuffer, mimeType, sessionId);
+      base64Audio = conversionResult.base64Audio;
+      finalMimeType = conversionResult.mimeType;
+      console.log(`[AudioProcessor] Successfully converted combined buffer (${totalSize} bytes) to ${finalMimeType} for session ${sessionId}`);
+    } catch (conversionError) {
+      console.error(`[AudioProcessor] Failed to convert combined buffer for session ${sessionId}, using original format:`, conversionError);
+      // Fall back to original format - let Gemini try to handle it
     }
 
     try {
@@ -464,45 +442,232 @@ export class AudioProcessor {
   }
 
   /**
-   * Convert combined in-memory audio buffer directly to MP3
-   * Fallback method when chunk files are not available
+   * Convert combined buffer to MP3 using FFmpeg pipe input
+   * This handles fragmented WebM by streaming the data directly to FFmpeg
    */
-  private async convertBufferToMp3(
+  private async convertBufferToMp3WithPipe(
     audioBuffer: Buffer,
     inputMimeType: string,
     sessionId: string
   ): Promise<{ base64Audio: string; mimeType: string }> {
     const tempDir = await mkdtemp(join(tmpdir(), `session-${sessionId}-`));
-    const inputFile = join(tempDir, `input-${Date.now()}.${this.getExtensionForMime(inputMimeType)}`);
     const outputFile = join(tempDir, `output-${Date.now()}.mp3`);
 
-    try {
-      // Write combined buffer to temp file
-      await writeFile(inputFile, audioBuffer);
-      console.log(`[AudioProcessor] Wrote ${audioBuffer.length} bytes to temp file for conversion`);
+    return new Promise((resolve, reject) => {
+      // Use pipe input to stream the buffer directly to FFmpeg
+      // This allows FFmpeg to handle fragmented WebM streams properly
+      const isWebM = inputMimeType?.toLowerCase().includes("webm");
+      const ffmpegArgs = [
+        "-y",
+        "-loglevel", "warning",
+        ...(isWebM ? ["-f", "webm"] : []), // Add format flag as separate arguments if WebM
+        "-err_detect", "ignore_err",
+        "-fflags", "+genpts",
+        "-i", "pipe:0", // Read from stdin
+        "-acodec", "libmp3lame",
+        "-ar", "16000",
+        "-ac", "1",
+        "-b:a", "64k",
+        "-f", "mp3",
+        outputFile
+      ];
 
-      // Convert to MP3 using FFmpeg
-      // Use -err_detect ignore_err to handle incomplete WebM headers gracefully
-      // Use -fflags +genpts to generate timestamps for streamed content
-      const ffmpegCommand = `ffmpeg -y -loglevel warning -err_detect ignore_err -fflags +genpts -i "${inputFile}" -acodec libmp3lame -ar 16000 -ac 1 -b:a 64k -f mp3 "${outputFile}"`;
+      const ffmpeg = spawn("ffmpeg", ffmpegArgs, {
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+
+      let stderr = "";
+      let ffmpegExited = false;
+
+      ffmpeg.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
+
+      // Handle stdin errors (EPIPE when FFmpeg exits early)
+      ffmpeg.stdin.on("error", (error: any) => {
+        if (error.code === "EPIPE" && !ffmpegExited) {
+          // FFmpeg closed stdin early, wait for it to finish
+          console.warn(`[AudioProcessor] FFmpeg stdin closed early (EPIPE), waiting for process to complete...`);
+          return;
+        }
+        if (!ffmpegExited) {
+          reject(new Error(`FFmpeg stdin error: ${error.message}`));
+        }
+      });
+
+      ffmpeg.on("error", (error) => {
+        if (!ffmpegExited) {
+          ffmpegExited = true;
+          reject(new Error(`FFmpeg spawn failed: ${error.message}`));
+        }
+      });
+
+      ffmpeg.on("close", async (code) => {
+        ffmpegExited = true;
+        
+        if (code !== 0) {
+          await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+          reject(new Error(`FFmpeg conversion failed with code ${code}: ${stderr.substring(0, 300)}`));
+          return;
+        }
+
+        try {
+          if (!existsSync(outputFile)) {
+            throw new Error("FFmpeg conversion failed - output file not created");
+          }
+
+          const stats = await stat(outputFile);
+          if (stats.size === 0) {
+            throw new Error("FFmpeg conversion produced empty file");
+          }
+
+          const mp3Buffer = await readFile(outputFile);
+          console.log(`[AudioProcessor] Converted ${audioBuffer.length} bytes to ${stats.size} byte MP3 (${(stats.size / 1024).toFixed(1)} KB)`);
+
+          // Verify duration using ffprobe if available
+          try {
+            const { stdout: durationOut } = await execAsync(
+              `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
+              {
+                maxBuffer: 1024 * 1024,
+                timeout: 10000,
+              }
+            );
+            const duration = parseFloat(durationOut.trim());
+            console.log(`[AudioProcessor] MP3 duration: ${duration.toFixed(2)} seconds (expected ~30s)`);
+            if (duration < 5) {
+              console.warn(
+                `[AudioProcessor] ⚠️ WARNING: MP3 is only ${duration.toFixed(2)}s, expected ~30s. Audio may be truncated.`
+              );
+            } else if (duration >= 25 && duration <= 35) {
+              console.log(`[AudioProcessor] ✅ MP3 duration is correct: ${duration.toFixed(2)}s`);
+            }
+          } catch (probeError) {
+            // ffprobe not available or failed, continue anyway
+            console.warn(`[AudioProcessor] Could not verify MP3 duration: ${probeError}`);
+          }
+
+          const base64Audio = mp3Buffer.toString("base64");
+
+          if (SAVE_MP3_DEBUG) {
+            await this.saveDebugMp3(sessionId, mp3Buffer);
+          }
+
+          // Clean up temp directory
+          await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+
+          resolve({ base64Audio, mimeType: "audio/mp3" });
+        } catch (error: any) {
+          await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+          reject(error);
+        }
+      });
+
+      // Write buffer to FFmpeg stdin with error handling
+      try {
+        if (!ffmpeg.stdin.destroyed && !ffmpegExited) {
+          ffmpeg.stdin.write(audioBuffer, (error) => {
+            if (error && (error as any).code !== "EPIPE" && !ffmpegExited) {
+              console.error(`[AudioProcessor] Error writing to FFmpeg stdin:`, error.message);
+            }
+          });
+          ffmpeg.stdin.end();
+        }
+      } catch (error: any) {
+        if (error?.code !== "EPIPE" && !ffmpegExited) {
+          console.error(`[AudioProcessor] Error writing to FFmpeg stdin:`, error?.message || String(error));
+        }
+      }
+    });
+  }
+
+  /**
+   * Convert individual buffer chunks to MP3, then concatenate
+   * This handles WebM fragments by processing each chunk individually to extract audio
+   */
+  private async convertChunksToMp3(
+    bufferChunks: Buffer[],
+    inputMimeType: string,
+    sessionId: string
+  ): Promise<{ base64Audio: string; mimeType: string }> {
+    if (bufferChunks.length === 0) {
+      throw new Error("No chunks provided for conversion");
+    }
+
+    const tempDir = await mkdtemp(join(tmpdir(), `session-${sessionId}-`));
+    const convertedChunks: string[] = [];
+
+    try {
+      // Step 1: Convert each chunk individually to MP3
+      // Each chunk (even fragments) can be processed separately to extract audio stream
+      for (let i = 0; i < bufferChunks.length; i++) {
+        const chunk = bufferChunks[i];
+        const inputChunk = join(tempDir, `chunk-${i}-input.${this.getExtensionForMime(inputMimeType)}`);
+        const outputChunk = join(tempDir, `chunk-${i}.mp3`);
+
+        await writeFile(inputChunk, chunk);
+
+        // Convert individual chunk to MP3 - extract audio stream from fragment
+        // Use -f webm to force format, -err_detect ignore_err for fragments
+        // -fflags +genpts generates timestamps for streamed content
+        const isWebM = inputMimeType?.toLowerCase().includes("webm");
+        const formatFlag = isWebM ? "-f webm" : "";
+        const convertCommand = `ffmpeg -y -loglevel error ${formatFlag} -err_detect ignore_err -fflags +genpts -i "${inputChunk}" -acodec libmp3lame -ar 16000 -ac 1 -b:a 64k -f mp3 "${outputChunk}"`;
+
+        try {
+          await execAsync(convertCommand, {
+            maxBuffer: 10 * 1024 * 1024,
+            timeout: 30000,
+          });
+
+          if (existsSync(outputChunk)) {
+            const stats = await stat(outputChunk);
+            if (stats.size > 0) {
+              convertedChunks.push(outputChunk);
+            }
+          }
+        } catch (error: any) {
+          // Skip invalid chunks - continue with others
+          console.warn(`[AudioProcessor] Failed to convert chunk ${i + 1}/${bufferChunks.length}, skipping: ${error.message?.substring(0, 100)}`);
+        } finally {
+          // Clean up input chunk file
+          await unlink(inputChunk).catch(() => {});
+        }
+      }
+
+      if (convertedChunks.length === 0) {
+        throw new Error("No chunks were successfully converted to MP3");
+      }
+
+      console.log(`[AudioProcessor] Successfully converted ${convertedChunks.length}/${bufferChunks.length} chunks to MP3`);
+
+      // Step 2: Concatenate all MP3 chunks using concat demuxer
+      const concatListPath = join(tempDir, "chunks.txt");
+      const concatContent = convertedChunks
+        .map((filePath) => `file '${filePath.replace(/'/g, "'\\''")}'`)
+        .join("\n");
+      await writeFile(concatListPath, concatContent);
+
+      const outputFile = join(tempDir, `combined-${Date.now()}.mp3`);
+      // Use concat demuxer for MP3 files (MP3s are complete files, not fragments)
+      const ffmpegCommand = `ffmpeg -y -loglevel warning -f concat -safe 0 -i "${concatListPath}" -acodec copy "${outputFile}"`;
 
       const { stdout, stderr } = await execAsync(ffmpegCommand, {
         maxBuffer: 10 * 1024 * 1024,
         timeout: 60000,
       });
 
-      // Verify output file
       if (!existsSync(outputFile)) {
-        throw new Error("FFmpeg conversion failed - output file not created");
+        throw new Error("FFmpeg concat failed - output file not created");
       }
 
       const stats = await stat(outputFile);
       if (stats.size === 0) {
-        throw new Error("FFmpeg conversion produced empty file");
+        throw new Error("FFmpeg concat produced empty file");
       }
 
       const mp3Buffer = await readFile(outputFile);
-      console.log(`[AudioProcessor] Converted ${audioBuffer.length} bytes to ${stats.size} byte MP3 (${(stats.size / 1024).toFixed(1)} KB)`);
+      console.log(`[AudioProcessor] Combined ${convertedChunks.length} MP3 chunks into ${stats.size} byte MP3 (${(stats.size / 1024).toFixed(1)} KB)`);
 
       // Verify duration using ffprobe if available
       try {
@@ -535,12 +700,10 @@ export class AudioProcessor {
 
       return { base64Audio, mimeType: "audio/mp3" };
     } catch (error: any) {
-      console.error(`[AudioProcessor] FFmpeg conversion failed:`, error.message?.substring(0, 300));
+      console.error(`[AudioProcessor] Chunk conversion failed:`, error.message?.substring(0, 300));
       throw error;
     } finally {
-      // Clean up temp files
-      await unlink(inputFile).catch(() => {});
-      await unlink(outputFile).catch(() => {});
+      // Clean up temp directory (but keep debug MP3 if saved)
       await rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
   }
