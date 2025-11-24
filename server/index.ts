@@ -43,11 +43,14 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 4000;
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`WebSocket server running on port ${PORT}`);
   
+  // Resume interrupted sessions on startup (crash recovery)
+  await audioProcessor.resumeInterruptedSessions().catch(console.error);
+  
   // Clean up old audio files on startup and then every 24 hours
-  audioProcessor.cleanupOldAudioFiles().catch(console.error);
+  await audioProcessor.cleanupOldAudioFiles().catch(console.error);
   
   // Schedule periodic cleanup (every 24 hours)
   setInterval(() => {

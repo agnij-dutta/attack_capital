@@ -2,6 +2,13 @@ import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { writeFile, unlink } from "fs/promises";
+import { exec } from "child_process";
+import { promisify } from "util";
+import { tmpdir } from "os";
+import { randomUUID } from "crypto";
+
+const execAsync = promisify(exec);
 
 // Load .env from server directory
 const __filename = fileURLToPath(import.meta.url);
@@ -23,6 +30,111 @@ if (!process.env.GEMINI_API_KEY) {
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
+
+/**
+ * Convert audio from WebM/OGG to MP3 (Gemini supported format)
+ * Uses ffmpeg for conversion
+ * 
+ * Gemini API supports: WAV, MP3, AIFF, AAC, OGG Vorbis, FLAC
+ * Browser MediaRecorder typically outputs: WebM (not supported)
+ * This function converts WebM to MP3 for Gemini compatibility
+ */
+async function convertAudioToMP3(
+  base64Audio: string,
+  inputMimeType: string
+): Promise<string> {
+  // Determine input file extension based on mimeType
+  const getInputExtension = (mime: string): string => {
+    if (mime.includes("webm")) return "webm";
+    if (mime.includes("ogg")) return "ogg";
+    return "webm"; // default
+  };
+  // Check if ffmpeg is available
+  try {
+    await execAsync("ffmpeg -version");
+  } catch (error) {
+    throw new Error(
+      "FFmpeg is not installed. Please install FFmpeg to enable audio conversion.\n" +
+      "Installation: macOS: brew install ffmpeg | Ubuntu: sudo apt install ffmpeg | Windows: choco install ffmpeg"
+    );
+  }
+
+  const tempDir = tmpdir();
+  const inputExt = getInputExtension(inputMimeType);
+  const inputFile = join(tempDir, `input-${randomUUID()}.${inputExt}`);
+  const outputFile = join(tempDir, `output-${randomUUID()}.mp3`);
+
+  try {
+    // Decode base64 and write to temp file
+    const audioBuffer = Buffer.from(base64Audio, "base64");
+    await writeFile(inputFile, audioBuffer);
+
+    // Convert using ffmpeg
+    // -y: overwrite output file
+    // -i: input file
+    // -acodec libmp3lame: use MP3 codec
+    // -ar 16000: sample rate 16kHz (Gemini downsamples to 16kHz anyway)
+    // -ac 1: mono channel (Gemini combines channels anyway)
+    // -b:a 64k: bitrate 64kbps (sufficient for speech)
+    // -f mp3: force MP3 format
+    // -loglevel error: only show errors (reduce noise)
+    const ffmpegCommand = `ffmpeg -y -loglevel error -i "${inputFile}" -acodec libmp3lame -ar 16000 -ac 1 -b:a 64k -f mp3 "${outputFile}"`;
+    
+    try {
+      await execAsync(ffmpegCommand, { 
+        maxBuffer: 10 * 1024 * 1024, // 10MB buffer for large outputs
+        timeout: 30000, // 30 second timeout
+      });
+    } catch (execError: any) {
+      // Check if output file exists despite error (ffmpeg sometimes reports errors but succeeds)
+      const { existsSync, statSync } = await import("fs");
+      if (existsSync(outputFile)) {
+        const stats = statSync(outputFile);
+        if (stats.size > 0) {
+          // File exists and has content, conversion likely succeeded
+          console.warn("[Gemini] FFmpeg reported error but file was created successfully");
+        } else {
+          throw new Error("FFmpeg output file is empty");
+        }
+      } else {
+        // File doesn't exist, conversion failed
+        const errorMsg = execError.stderr || execError.stdout || execError.message || String(execError);
+        console.error("[Gemini] FFmpeg conversion failed:", errorMsg.substring(0, 500));
+        throw new Error(`FFmpeg conversion failed: ${errorMsg.substring(0, 200)}`);
+      }
+    }
+    
+    // Verify output file was created and has content
+    const { existsSync, statSync } = await import("fs");
+    if (!existsSync(outputFile)) {
+      throw new Error("FFmpeg output file was not created");
+    }
+    
+    const stats = statSync(outputFile);
+    if (stats.size === 0) {
+      throw new Error("FFmpeg output file is empty");
+    }
+
+    // Read converted file and encode to base64
+    const { readFile } = await import("fs/promises");
+    const convertedBuffer = await readFile(outputFile);
+    const convertedBase64 = convertedBuffer.toString("base64");
+
+    // Cleanup temp files
+    await unlink(inputFile).catch(() => {});
+    await unlink(outputFile).catch(() => {});
+
+    return convertedBase64;
+  } catch (error) {
+    // Cleanup on error
+    await unlink(inputFile).catch(() => {});
+    await unlink(outputFile).catch(() => {});
+    
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error("[Gemini] FFmpeg conversion error:", errorMessage);
+    throw new Error(`Audio conversion failed: ${errorMessage}`);
+  }
+}
 
 /**
  * Transcribes an audio chunk using Gemini API
@@ -50,13 +162,43 @@ export async function transcribeAudio(
       return "[silence]";
     }
 
-    // Ensure mimeType is valid
-    const validMimeType = mimeType || "audio/webm";
+    // Convert WebM to MP3 (Gemini supported format) if needed
+    let finalAudioData = audioData;
+    let finalMimeType = mimeType || "audio/webm";
     
-    console.log(`[Gemini] Transcribing audio chunk: ${audioData.length} bytes, mimeType: ${validMimeType}`);
+    // Check if we need to convert (WebM is not supported by Gemini)
+    // Gemini supports: WAV, MP3, AIFF, AAC, OGG Vorbis, FLAC
+    // OGG is supported, so we only convert WebM
+    const supportedFormats = ["audio/mp3", "audio/mpeg", "audio/wav", "audio/aiff", "audio/aac", "audio/flac", "audio/ogg"];
+    const isSupported = mimeType && supportedFormats.some(format => mimeType.toLowerCase().includes(format.split("/")[1]));
+    const needsConversion = mimeType?.includes("webm") || (!isSupported && mimeType);
+    
+    if (needsConversion) {
+      try {
+        // Check if ffmpeg is available
+        try {
+          await execAsync("ffmpeg -version");
+        } catch (ffmpegError) {
+          console.warn("[Gemini] FFmpeg not found. Audio conversion requires ffmpeg to be installed.");
+          console.warn("[Gemini] Attempting to use original format - this may fail if format is not supported by Gemini.");
+          // Continue with original format - Gemini might still accept it
+        }
+        
+        console.log(`[Gemini] Converting audio from ${mimeType} to MP3 (Gemini supported format)`);
+        finalAudioData = await convertAudioToMP3(audioData, mimeType || "audio/webm");
+        finalMimeType = "audio/mp3";
+        console.log(`[Gemini] Audio converted successfully: ${finalAudioData.length} bytes`);
+      } catch (error) {
+        console.error(`[Gemini] Audio conversion failed:`, error);
+        console.warn(`[Gemini] Falling back to original format - this may cause transcription to fail`);
+        // Keep original data and format - let Gemini API return error if unsupported
+        // This way we get a clear error message
+      }
+    }
+    
+    console.log(`[Gemini] Transcribing audio chunk: ${finalAudioData.length} bytes, mimeType: ${finalMimeType}`);
 
-    // Ultra-simple, direct prompt for maximum accuracy
-    // Put audio FIRST, then minimal instruction
+    // Enhanced prompt for accurate, continuous transcription
     let promptText = "";
     
     // Only include context if there's substantial previous speech
@@ -66,59 +208,123 @@ export async function transcribeAudio(
       previousContext.length > 20;
     
     if (hasActualSpeech) {
-      // Include context but keep prompt minimal
-      promptText = `Previous: ${previousContext.substring(0, 200)}...\n\nTranscribe the audio. Format: [Speaker 1]: text. Use [silence] if no speech, [inaudible] if unclear.`;
+      // Include context for continuity - very minimal prompt
+      // Put context first, then simple instruction
+      promptText = `Previous transcript:
+${previousContext}
+
+Now transcribe the new audio. Continue from above. Format: [Speaker 1]: new words only.`;
     } else {
-      // Minimal prompt - just the essentials
-      promptText = `Transcribe the audio. Format: [Speaker 1]: text. Use [silence] if no speech, [inaudible] if unclear.`;
+      // First chunk - very minimal prompt
+      promptText = `Transcribe this audio. Format: [Speaker 1]: words spoken.`;
     }
 
-    // Put audio FIRST, then prompt - this helps the model focus on audio
-    // Try gemini-2.0-flash-exp first (better for audio), fallback to 2.5-flash
+    // Use gemini-2.5-flash for audio transcription (most reliable)
+    // Skip experimental models that may not be available or are rate-limited
     let response;
-    try {
-      response = await ai.models.generateContent({
-        model: "gemini-2.0-flash-exp",
-        contents: [
-          {
-            parts: [
-              {
-                inlineData: {
-                  data: audioData,
-                  mimeType: validMimeType,
+    let lastError: Error | null = null;
+    
+    // Use standard model - most reliable and available
+    const model = "gemini-2.5-flash";
+    const maxRetries = 3;
+    const baseRetryDelay = 2000; // 2 seconds base delay
+    
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        response = await ai.models.generateContent({
+          model: model,
+          contents: [
+            {
+              parts: [
+                {
+                  inlineData: {
+                    data: finalAudioData,
+                    mimeType: finalMimeType,
+                  },
                 },
-              },
-              {
-                text: promptText,
-              },
-            ],
-          },
-        ],
-      });
-    } catch (error) {
-      // Fallback to standard model if experimental fails
-      console.warn("[Gemini] Experimental model failed, using standard model:", error);
-      response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [
-          {
-            parts: [
-              {
-                inlineData: {
-                  data: audioData,
-                  mimeType: validMimeType,
+                {
+                  text: promptText,
                 },
-              },
-              {
-                text: promptText,
-              },
-            ],
-          },
-        ],
-      });
+              ],
+            },
+          ],
+        });
+        console.log(`[Gemini] Successfully transcribed using model: ${model} (attempt ${attempt + 1})`);
+        break; // Success
+      } catch (error) {
+        lastError = error as Error;
+        const errorMessage = (error as Error).message || String(error);
+        const errorObj = error as any;
+        
+        // Check if it's a rate limit error with retry delay
+        const isRateLimit = 
+          errorMessage.includes("429") ||
+          errorMessage.includes("rate limit") ||
+          errorMessage.includes("quota") ||
+          errorMessage.includes("RESOURCE_EXHAUSTED");
+        
+        // Extract retry delay from error if available
+        let retryDelay = baseRetryDelay * Math.pow(2, attempt); // Exponential backoff
+        
+        if (isRateLimit && errorObj?.error?.details) {
+          // Try to extract retry delay from API response
+          const retryInfo = errorObj.error.details.find((d: any) => d["@type"] === "type.googleapis.com/google.rpc.RetryInfo");
+          if (retryInfo?.retryDelay) {
+            // Parse delay (format: "58s" or similar)
+            const delayMatch = retryInfo.retryDelay.match(/(\d+)/);
+            if (delayMatch) {
+              retryDelay = parseInt(delayMatch[1]) * 1000; // Convert to milliseconds
+              console.warn(`[Gemini] Rate limit hit, waiting ${retryDelay}ms as suggested by API`);
+            }
+          }
+        }
+        
+        // Check if error is retryable
+        const isRetryable = 
+          isRateLimit ||
+          errorMessage.includes("network") ||
+          errorMessage.includes("timeout") ||
+          errorMessage.includes("503") ||
+          errorMessage.includes("500");
+        
+        if (isRetryable && attempt < maxRetries - 1) {
+          console.warn(`[Gemini] Model ${model} failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${retryDelay}ms:`, errorMessage.substring(0, 200));
+          await new Promise((resolve) => setTimeout(resolve, retryDelay));
+          continue; // Retry
+        } else {
+          console.error(`[Gemini] Model ${model} failed (attempt ${attempt + 1}/${maxRetries}):`, errorMessage.substring(0, 200));
+          if (attempt === maxRetries - 1) {
+            // Last attempt failed, throw error
+            throw new Error(`Transcription failed after ${maxRetries} attempts: ${errorMessage.substring(0, 200)}`);
+          }
+        }
+      }
+    }
+    
+    if (!response) {
+      throw new Error(`Transcription failed. Last error: ${lastError?.message}`);
     }
 
-    const text = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    let text = response.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    
+    // Remove the prompt text if it appears at the start of the response
+    // This happens sometimes when the model echoes the prompt
+    if (text) {
+      const originalText = text;
+      const promptLines = promptText.split('\n').map(l => l.trim()).filter(l => l.length > 5);
+      for (const promptLine of promptLines) {
+        const lowerPrompt = promptLine.toLowerCase();
+        const lowerText = text.toLowerCase();
+        // Only remove if it's at the very start and exact match
+        if (lowerText.startsWith(lowerPrompt) && text.length > promptLine.length) {
+          text = text.substring(promptLine.length).trim();
+          // Only log if we actually removed something significant
+          if (originalText.length - text.length > 10) {
+            console.log(`[Gemini] Removed ${originalText.length - text.length} chars of prompt text from start`);
+          }
+        }
+      }
+    }
     
     console.log(`[Gemini] Raw transcription response length: ${text.length}`);
     
@@ -150,102 +356,42 @@ export async function transcribeAudio(
       return "[unclear]";
     }
     
-    // Remove any hallucinated content patterns (like reading the prompt back or making up conversations)
-    if (cleanedText.toLowerCase().includes("transcribe") && 
-        (cleanedText.toLowerCase().includes("audio") || cleanedText.toLowerCase().includes("spoken words"))) {
-      console.warn("[Gemini] AI may have transcribed the prompt instead of audio. Removing prompt text.");
-      // Remove lines that contain prompt text
-      const lines = cleanedText.split('\n');
-      const filteredLines = lines.filter(line => {
-        const lowerLine = line.toLowerCase();
-        return !lowerLine.includes("transcribe") &&
-               !lowerLine.includes("output only") &&
-               !lowerLine.includes("format:") &&
-               !lowerLine.includes("use inaudible") &&
-               !lowerLine.includes("spoken words");
-      });
-      cleanedText = filteredLines.join('\n');
+    // Remove prompt text that might appear in response (very specific patterns only)
+    // Be very conservative - only remove if it's clearly just the prompt with no actual transcription
+    const lowerText = cleanedText.toLowerCase();
+    const hasSpeakerLabels = cleanedText.includes("[Speaker");
+    
+    // Only flag as prompt if: has specific prompt phrases AND no speaker labels AND very short
+    const isJustPrompt = !hasSpeakerLabels && 
+                        cleanedText.length < 100 &&
+                        (lowerText.includes("transcribe this audio") || 
+                         lowerText.includes("format: [speaker 1]") ||
+                         (lowerText.includes("previous transcript") && !lowerText.includes("speaker")));
+    
+    if (isJustPrompt) {
+      console.warn("[Gemini] Response appears to be only prompt text, no transcription. Returning silence.");
+      return "[silence]";
     }
     
-    // AGGRESSIVE hallucination detection - common business/meeting phrases that indicate AI is making things up
-    const businessHallucinationPatterns = [
-      /budget|Q[1-4]|quarter|fiscal|profitability|ROI|revenue|expenses/gi,
-      /marketing\s+spend|advertising|campaigns|digital\s+campaigns/gi,
-      /revised\s+budget|preliminary|optimized|reallocated/gi,
-      /projected\s+impact|marginal\s+improvement|better\s+ROI/gi,
-      /traditional\s+advertising|shift\s+towards\s+digital/gi,
-      /higher\s+returns|better\s+returns/gi,
-    ];
-    
-    // Check if response contains business jargon (strong indicator of hallucination)
-    const hasBusinessJargon = businessHallucinationPatterns.some(pattern => pattern.test(cleanedText));
-    
-    // Also check for generic meeting phrases
-    const genericMeetingPatterns = [
-      /okay,?\s+let'?s\s+get\s+started/gi,
-      /sounds\s+good\s+to\s+me/gi,
-      /first\s+on\s+the\s+agenda/gi,
-      /sorry,?\s+i\s+was\s+on\s+mute/gi,
-      /no\s+problem/gi,
-      /as\s+i\s+was\s+saying/gi,
-      /can\s+you\s+repeat\s+that/gi,
-      /what\s+do\s+you\s+think/gi,
-      /that'?s\s+a\s+good\s+point/gi,
-      /let'?s\s+move\s+on/gi,
-      /just\s+to\s+clarify/gi,
-      /we'?re\s+looking\s+at/gi,
-      /that'?s\s+right/gi,
-      /we\s+anticipate|we\s+expect/gi,
-    ];
-    
-    const containsGenericPhrases = genericMeetingPatterns.some(pattern => pattern.test(cleanedText));
-    
-    // If response contains business jargon or generic phrases, it's likely a hallucination
-    if (hasBusinessJargon || containsGenericPhrases) {
-      console.warn(`[Gemini] Detected hallucination patterns in response. Original: ${cleanedText.substring(0, 200)}`);
-      
-      // Check if there are multiple speakers - if so, definitely hallucination
-      const speakerCount = (cleanedText.match(/\[Speaker \d+\]:/g) || []).length;
-      if (speakerCount > 1) {
-        console.warn(`[Gemini] Multiple speakers detected with business jargon - rejecting as hallucination`);
-        return "[silence]";
-      }
-      
-      // If response is long and contains business terms, reject it
-      if (cleanedText.length > 100 && hasBusinessJargon) {
-        console.warn(`[Gemini] Long response with business jargon - rejecting as hallucination`);
-        return "[silence]";
-      }
-      
-      // Remove lines containing business jargon
+    // If response has speaker labels, it's valid transcription - don't filter
+    if (hasSpeakerLabels) {
+      // Valid transcription - keep as is
+      // Just remove any prompt text that might be at the start
       const lines = cleanedText.split('\n');
       const filteredLines = lines.filter(line => {
-        const trimmedLine = line.trim();
-        if (!trimmedLine) return false;
-        
-        // Check for business jargon in this line
-        const lineHasBusinessJargon = businessHallucinationPatterns.some(pattern => pattern.test(trimmedLine));
-        const lineHasGenericPhrase = genericMeetingPatterns.some(pattern => pattern.test(trimmedLine));
-        
-        if (lineHasBusinessJargon || lineHasGenericPhrase) {
-          console.warn(`[Gemini] Removing hallucinated line: ${trimmedLine.substring(0, 80)}`);
-          return false;
-        }
-        
-        return true;
+        const lowerLine = line.toLowerCase().trim();
+        // Remove lines that are clearly just prompt instructions (not speech)
+        return !(lowerLine.startsWith("previous transcript:") ||
+                 lowerLine.startsWith("now transcribe") ||
+                 lowerLine.startsWith("continue from") ||
+                 (lowerLine.includes("format:") && !lowerLine.includes("[Speaker")));
       });
-      
       cleanedText = filteredLines.join('\n');
-      
-      // If nothing left after filtering, return silence
-      if (!cleanedText.trim() || cleanedText.trim() === "[silence]") {
-        return "[silence]";
-      }
     }
     
     // Check for suspicious multi-speaker patterns in short chunks
-    const lines = cleanedText.split('\n');
-    const filteredLines = lines.filter(line => {
+    const allLinesForCheck = cleanedText.split('\n');
+    const filteredLines = allLinesForCheck.filter(line => {
       const trimmedLine = line.trim();
       if (!trimmedLine) return false;
       
@@ -261,15 +407,74 @@ export async function transcribeAudio(
     
     cleanedText = filteredLines.join('\n');
     
-    // Final validation: if response is suspiciously long with multiple speakers, it's likely hallucinated
-    const speakerCount = (cleanedText.match(/\[Speaker \d+\]:/g) || []).length;
-    if (speakerCount > 1 && cleanedText.length > 150) {
-      // Multiple speakers in a long response is suspicious - check if it contains business jargon
-      if (hasBusinessJargon) {
-        console.warn(`[Gemini] Rejecting long multi-speaker response with business jargon as hallucination`);
-        return "[silence]";
+    // Smart repetition detection - only remove if it's clearly a hallucination
+    // Check for exact duplicate lines (same line appearing multiple times consecutively)
+    const textLinesForDedup = cleanedText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    const deduplicatedLines: string[] = [];
+    let lastLine = "";
+    let consecutiveDuplicates = 0;
+    
+    for (let i = 0; i < textLinesForDedup.length; i++) {
+      const currentLine = textLinesForDedup[i];
+      const normalizedLine = currentLine.toLowerCase();
+      
+      // Check if this line is exactly the same as the previous line
+      if (normalizedLine === lastLine.toLowerCase() && normalizedLine.length > 15) {
+        consecutiveDuplicates++;
+        // Only keep first occurrence if we see 2+ consecutive duplicates
+        if (consecutiveDuplicates >= 2) {
+          console.warn(`[Gemini] Removing consecutive duplicate line (${consecutiveDuplicates + 1} times): ${currentLine.substring(0, 60)}`);
+          continue; // Skip this duplicate
+        }
+      } else {
+        consecutiveDuplicates = 0; // Reset counter
+      }
+      
+      deduplicatedLines.push(currentLine);
+      lastLine = currentLine;
+    }
+    
+    cleanedText = deduplicatedLines.join('\n');
+    
+    // Also check for phrase repetition within the same chunk (but be less aggressive)
+    // Only flag if the same 5+ word phrase appears 3+ times in a single chunk
+    const allText = cleanedText.toLowerCase();
+    const words = allText.split(/\s+/).filter(w => w.length > 2);
+    
+    if (words.length > 15) {
+      // Check for 5-word phrase repetition (more specific, less false positives)
+      const phraseCounts = new Map<string, number>();
+      for (let i = 0; i < words.length - 4; i++) {
+        const phrase = words.slice(i, i + 5).join(' '); // 5-word phrases
+        phraseCounts.set(phrase, (phraseCounts.get(phrase) || 0) + 1);
+      }
+      
+      // Only remove if a phrase appears 4+ times (very suspicious)
+      for (const [phrase, count] of phraseCounts.entries()) {
+        if (count >= 4) {
+          console.warn(`[Gemini] Detected highly repetitive phrase "${phrase}" ${count} times - likely hallucination`);
+          // Remove all but first occurrence
+          const phraseLines = cleanedText.split('\n');
+          let foundFirst = false;
+          const filteredPhraseLines = phraseLines.filter(line => {
+            const lowerLine = line.toLowerCase();
+            if (lowerLine.includes(phrase)) {
+              if (!foundFirst) {
+                foundFirst = true;
+                return true;
+              }
+              return false;
+            }
+            return true;
+          });
+          cleanedText = filteredPhraseLines.join('\n');
+          break;
+        }
       }
     }
+    
+    // Final validation: check speaker count for logging
+    const speakerCount = (cleanedText.match(/\[Speaker \d+\]:/g) || []).length;
     
     // If the cleaned text is empty, return a placeholder
     if (!cleanedText.trim()) {

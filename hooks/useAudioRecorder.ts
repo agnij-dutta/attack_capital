@@ -2,6 +2,13 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { io, Socket } from "socket.io-client";
+import {
+  queueChunk,
+  getQueuedChunks,
+  removeChunk,
+  incrementRetryCount,
+  clearSessionQueue,
+} from "@/lib/audioQueue";
 
 type RecordingMode = "mic" | "tab";
 
@@ -51,11 +58,14 @@ export function useAudioRecorder(
       reconnectionAttempts: 5,
     });
 
-    socket.on("connect", () => {
+    socket.on("connect", async () => {
       console.log("WebSocket connected");
       if (sessionIdRef.current) {
         socket.emit("join-session", sessionIdRef.current);
         console.log(`Joined session room: ${sessionIdRef.current}`);
+        
+        // Process any queued chunks when reconnected
+        await processQueuedChunks(sessionIdRef.current, socket);
       }
     });
 
@@ -106,6 +116,65 @@ export function useAudioRecorder(
     socketRef.current = socket;
     return socket;
   }, [websocketUrl, state]);
+
+  /**
+   * Process queued chunks when connection is restored
+   */
+  const processQueuedChunks = useCallback(async (sessionId: string, socket: Socket) => {
+    try {
+      const queuedChunks = await getQueuedChunks(sessionId);
+      if (queuedChunks.length === 0) {
+        return;
+      }
+
+      console.log(`[AudioRecorder] Processing ${queuedChunks.length} queued chunks for session ${sessionId}`);
+
+      // Sort by timestamp to maintain order
+      queuedChunks.sort((a, b) => a.timestamp - b.timestamp);
+
+      // Process chunks with rate limiting (one every 100ms to avoid overwhelming)
+      for (const chunk of queuedChunks) {
+        if (chunk.retryCount >= 5) {
+          console.warn(`[AudioRecorder] Chunk ${chunk.id} exceeded max retries, removing`);
+          await removeChunk(chunk.id);
+          continue;
+        }
+
+        try {
+          socket.emit("audio-chunk", {
+            sessionId: chunk.sessionId,
+            audioData: chunk.audioData,
+            mimeType: chunk.mimeType,
+          });
+
+          // Wait for acknowledgment
+          await new Promise<void>((resolve) => {
+            const timeout = setTimeout(async () => {
+              // No ack received, increment retry count
+              await incrementRetryCount(chunk.id);
+              resolve();
+            }, 2000);
+
+            socket.once("chunk-received", async () => {
+              clearTimeout(timeout);
+              await removeChunk(chunk.id);
+              resolve();
+            });
+          });
+
+          // Small delay between chunks
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        } catch (error) {
+          console.error(`[AudioRecorder] Error processing queued chunk ${chunk.id}:`, error);
+          await incrementRetryCount(chunk.id);
+        }
+      }
+
+      console.log(`[AudioRecorder] Finished processing queued chunks for session ${sessionId}`);
+    } catch (error) {
+      console.error("[AudioRecorder] Error processing queued chunks:", error);
+    }
+  }, []);
 
   /**
    * Start recording with specified mode
@@ -320,11 +389,18 @@ export function useAudioRecorder(
         // Initialize MediaRecorder with optimal settings for quality
         // For tab audio (Google Meet), use higher bitrate for better quality
         const isTabAudio = mode === "tab";
-        const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-          ? "audio/webm;codecs=opus"
+        // Try to use OGG format first (supported by Gemini), fallback to WebM if not available
+        // Gemini supports: WAV, MP3, AIFF, AAC, OGG Vorbis, FLAC
+        // WebM is NOT supported, so we prefer OGG (will be converted on server if WebM)
+        const mimeType = MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")
+          ? "audio/ogg;codecs=opus" // Preferred - supported by Gemini
+          : MediaRecorder.isTypeSupported("audio/ogg")
+          ? "audio/ogg" // Supported by Gemini
+          : MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus" // Will be converted to MP3 on server
           : MediaRecorder.isTypeSupported("audio/webm")
-          ? "audio/webm"
-          : "audio/mp4";
+          ? "audio/webm" // Will be converted to MP3 on server
+          : "audio/webm"; // Default fallback (will be converted)
         
         // Higher bitrate for better quality transcription accuracy
         // Opus codec supports up to 510kbps, but 256kbps is excellent for speech
@@ -366,18 +442,46 @@ export function useAudioRecorder(
 
             audioChunksRef.current.push(event.data);
 
-            // Send chunk to server via WebSocket
+            // Send chunk to server via WebSocket, with queue fallback
             const reader = new FileReader();
-            reader.onloadend = () => {
+            reader.onloadend = async () => {
               const base64Audio = (reader.result as string).split(",")[1];
               const currentSessionId = sessionIdRef.current;
-              if (socketRef.current?.connected && currentSessionId && base64Audio) {
-                console.log(`[AudioRecorder] Sending audio chunk: ${event.data.size} bytes, base64 length: ${base64Audio.length}`);
-                socketRef.current.emit("audio-chunk", {
-                  sessionId: currentSessionId,
-                  audioData: base64Audio,
-                  mimeType,
-                });
+              
+              if (!currentSessionId || !base64Audio) {
+                console.warn("[AudioRecorder] Missing sessionId or audio data");
+                return;
+              }
+
+              // Try to send immediately if connected
+              if (socketRef.current?.connected) {
+                try {
+                  console.log(`[AudioRecorder] Sending audio chunk: ${event.data.size} bytes, base64 length: ${base64Audio.length}`);
+                  socketRef.current.emit("audio-chunk", {
+                    sessionId: currentSessionId,
+                    audioData: base64Audio,
+                    mimeType,
+                  });
+                  
+                  // Wait for acknowledgment (chunk-received event)
+                  // If no ack within 2s, queue it
+                  const ackTimeout = setTimeout(async () => {
+                    console.warn("[AudioRecorder] No acknowledgment received, queueing chunk");
+                    await queueChunk(currentSessionId, base64Audio, mimeType);
+                  }, 2000);
+                  
+                  // Remove timeout on ack (handled in socket listener)
+                  socketRef.current.once("chunk-received", () => {
+                    clearTimeout(ackTimeout);
+                  });
+                } catch (error) {
+                  console.error("[AudioRecorder] Error sending chunk, queueing:", error);
+                  await queueChunk(currentSessionId, base64Audio, mimeType);
+                }
+              } else {
+                // Not connected - queue the chunk
+                console.log("[AudioRecorder] Not connected, queueing chunk for later");
+                await queueChunk(currentSessionId, base64Audio, mimeType);
               }
             };
             reader.onerror = (error) => {
@@ -465,35 +569,85 @@ export function useAudioRecorder(
     }
 
     const currentSessionId = sessionIdRef.current;
+    
+    // Process any remaining queued chunks before stopping
+    if (socketRef.current?.connected && currentSessionId) {
+      await processQueuedChunks(currentSessionId, socketRef.current);
+    }
+    
     if (socketRef.current && currentSessionId) {
       socketRef.current.emit("stop-recording", { sessionId: currentSessionId });
     }
-  }, []);
+    
+    // Clear queue after a delay (in case there are still pending chunks)
+    if (currentSessionId) {
+      setTimeout(async () => {
+        await clearSessionQueue(currentSessionId);
+      }, 5000);
+    }
+  }, [processQueuedChunks]);
 
   /**
    * Cancel recording
    */
-  const cancelRecording = useCallback(() => {
+  const cancelRecording = useCallback(async () => {
+    console.log("[AudioRecorder] Cancelling recording...");
+    
+    // Stop media recorder
     if (mediaRecorderRef.current) {
-      mediaRecorderRef.current.stop();
-      mediaRecorderRef.current.stream.getTracks().forEach((track) => track.stop());
+      try {
+        if (mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+        }
+        mediaRecorderRef.current.stream.getTracks().forEach((track) => {
+          track.stop();
+          track.enabled = false;
+        });
+      } catch (error) {
+        console.error("[AudioRecorder] Error stopping media recorder:", error);
+      }
       mediaRecorderRef.current = null;
     }
 
+    // Stop all stream tracks
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current.getTracks().forEach((track) => {
+        track.stop();
+        track.enabled = false;
+      });
       streamRef.current = null;
     }
 
     const currentSessionId = sessionIdRef.current;
+    
+    // Notify server to cancel
     if (socketRef.current && currentSessionId) {
-      socketRef.current.emit("cancel-recording", { sessionId: currentSessionId });
+      try {
+        socketRef.current.emit("cancel-recording", { sessionId: currentSessionId });
+        console.log(`[AudioRecorder] Sent cancel-recording for session ${currentSessionId}`);
+      } catch (error) {
+        console.error("[AudioRecorder] Error sending cancel-recording:", error);
+      }
     }
 
+    // Clear queued chunks for this session
+    if (currentSessionId) {
+      try {
+        await clearSessionQueue(currentSessionId);
+        console.log(`[AudioRecorder] Cleared queue for session ${currentSessionId}`);
+      } catch (error) {
+        console.error("[AudioRecorder] Error clearing queue:", error);
+      }
+    }
+
+    // Reset all state
     setState("idle");
     setSessionId(null);
     sessionIdRef.current = null;
     audioChunksRef.current = [];
+    setError(null);
+    
+    console.log("[AudioRecorder] Recording cancelled and state reset");
   }, []);
 
   // Cleanup on unmount

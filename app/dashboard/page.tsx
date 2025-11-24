@@ -35,6 +35,15 @@ export default function DashboardPage() {
     sessionId,
   } = useAudioRecorder(userId);
 
+  // Show error toasts
+  useEffect(() => {
+    if (error) {
+      toast.error(error, {
+        duration: 5000,
+      });
+    }
+  }, [error]);
+
   // Get user session
   useEffect(() => {
     async function getSession() {
@@ -145,12 +154,48 @@ export default function DashboardPage() {
   };
 
   const handleStop = async () => {
-    await stopRecording();
-    toast.success("Recording stopped. Processing transcript...");
-    if (sessionId) {
-      setTimeout(() => {
-        router.push(`/sessions/${sessionId}`);
-      }, 1000);
+    try {
+      await stopRecording();
+      toast.success("Recording stopped. Processing transcript...");
+      if (sessionId) {
+        setTimeout(() => {
+          router.push(`/sessions/${sessionId}`);
+        }, 1000);
+      }
+    } catch (error) {
+      toast.error("Failed to stop recording. Please try again.");
+      console.error("Error stopping recording:", error);
+    }
+  };
+
+  const handleCancel = async () => {
+    try {
+      await cancelRecording();
+      toast.success("Recording cancelled");
+      // Reset session time
+      setSessionTime(0);
+      // Clear live transcript
+      setLiveTranscript([]);
+    } catch (error) {
+      toast.error("Failed to cancel recording. Please try again.");
+      console.error("Error cancelling recording:", error);
+    }
+  };
+
+  const handleStart = async () => {
+    try {
+      await startRecording(recordingMode);
+      toast.success(`Recording started in ${recordingMode === "mic" ? "microphone" : "tab"} mode`);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Failed to start recording";
+      if (errorMessage.includes("permission") || errorMessage.includes("denied")) {
+        toast.error("Microphone or screen share permission denied. Please allow access and try again.");
+      } else if (errorMessage.includes("tab audio") || errorMessage.includes("Share tab audio")) {
+        toast.error("Please enable 'Share tab audio' when sharing your screen for meeting transcription.");
+      } else {
+        toast.error(`Failed to start recording: ${errorMessage}`);
+      }
+      console.error("Error starting recording:", error);
     }
   };
 
@@ -226,7 +271,7 @@ export default function DashboardPage() {
                     </Button>
                   </div>
                   <Button
-                    onClick={() => startRecording(recordingMode)}
+                    onClick={handleStart}
                     size="lg"
                     className="w-full"
                   >
@@ -298,7 +343,7 @@ export default function DashboardPage() {
                       Stop
                     </Button>
                     <Button
-                      onClick={cancelRecording}
+                      onClick={handleCancel}
                       variant="outline"
                       size="lg"
                       className="gap-2"
@@ -338,7 +383,7 @@ export default function DashboardPage() {
                       Stop
                     </Button>
                     <Button
-                      onClick={cancelRecording}
+                      onClick={handleCancel}
                       variant="outline"
                       size="lg"
                       className="gap-2"

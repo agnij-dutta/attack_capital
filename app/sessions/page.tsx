@@ -1,12 +1,14 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import LoadingLines from "@/components/ui/loading-lines";
+import { Search } from "lucide-react";
 
 interface Session {
   id: string;
@@ -23,6 +25,7 @@ export default function SessionsPage() {
   const router = useRouter();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState("");
 
   useEffect(() => {
     async function fetchSessions() {
@@ -54,6 +57,53 @@ export default function SessionsPage() {
     return new Date(dateString).toLocaleString();
   };
 
+  // Filter sessions based on search query
+  const filteredSessions = useMemo(() => {
+    if (!searchQuery.trim()) {
+      return sessions;
+    }
+
+    const query = searchQuery.toLowerCase();
+    return sessions.filter((session) => {
+      // Search in title
+      if (session.title?.toLowerCase().includes(query)) {
+        return true;
+      }
+      // Search in transcript
+      if (session.transcriptText?.toLowerCase().includes(query)) {
+        return true;
+      }
+      // Search in summary
+      if (session.summary?.toLowerCase().includes(query)) {
+        return true;
+      }
+      return false;
+    });
+  }, [sessions, searchQuery]);
+
+  // Generate preview snippet from transcript or summary
+  const getPreviewSnippet = (session: Session): string => {
+    if (session.summary) {
+      // Extract first meaningful sentence from summary
+      const summaryLines = session.summary.split("\n");
+      const firstLine = summaryLines.find((line) => line.trim().length > 20);
+      if (firstLine) {
+        return firstLine.trim().substring(0, 150) + (firstLine.length > 150 ? "..." : "");
+      }
+    }
+    if (session.transcriptText) {
+      // Extract first meaningful sentence from transcript
+      const sentences = session.transcriptText.split(/[.!?]\s+/);
+      const firstSentence = sentences.find((s) => s.trim().length > 20);
+      if (firstSentence) {
+        return firstSentence.trim().substring(0, 150) + (firstSentence.length > 150 ? "..." : "");
+      }
+      // Fallback to first 150 chars
+      return session.transcriptText.substring(0, 150) + (session.transcriptText.length > 150 ? "..." : "");
+    }
+    return "No transcript available";
+  };
+
 
   if (loading) {
     return (
@@ -69,26 +119,40 @@ export default function SessionsPage() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
       <div className="container mx-auto px-4 py-8">
-        <div className="mb-8 flex items-center justify-between">
-          <div>
-            <h1 className="text-4xl font-bold tracking-tight">Sessions</h1>
-            <p className="mt-2 text-muted-foreground">
-              View and manage your recording sessions
-            </p>
+        <div className="mb-8">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h1 className="text-4xl font-bold tracking-tight">Sessions</h1>
+              <p className="mt-2 text-muted-foreground">
+                View and manage your recording sessions
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Button asChild>
+                <Link href="/dashboard">New Session</Link>
+              </Button>
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  await fetch("/api/auth/sign-out", { method: "POST" });
+                  router.push("/sign-in");
+                }}
+              >
+                Sign Out
+              </Button>
+            </div>
           </div>
-          <div className="flex gap-2">
-            <Button asChild>
-              <Link href="/dashboard">New Session</Link>
-            </Button>
-            <Button
-              variant="outline"
-              onClick={async () => {
-                await fetch("/api/auth/sign-out", { method: "POST" });
-                router.push("/sign-in");
-              }}
-            >
-              Sign Out
-            </Button>
+          
+          {/* Search Input */}
+          <div className="relative max-w-md">
+            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-muted-foreground h-4 w-4" />
+            <Input
+              type="text"
+              placeholder="Search sessions by title, transcript, or summary..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pl-10"
+            />
           </div>
         </div>
 
@@ -101,9 +165,20 @@ export default function SessionsPage() {
               </Button>
             </CardContent>
           </Card>
+        ) : filteredSessions.length === 0 ? (
+          <Card className="text-center">
+            <CardContent className="pt-6">
+              <p className="text-muted-foreground mb-4">
+                No sessions found matching "{searchQuery}"
+              </p>
+              <Button variant="outline" onClick={() => setSearchQuery("")}>
+                Clear Search
+              </Button>
+            </CardContent>
+          </Card>
         ) : (
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {sessions.map((session) => (
+            {filteredSessions.map((session) => (
               <Link key={session.id} href={`/sessions/${session.id}`}>
                 <Card className="h-full transition-all hover:shadow-lg hover:scale-[1.02] cursor-pointer">
                   <CardHeader>
@@ -131,12 +206,9 @@ export default function SessionsPage() {
                     <p className="text-sm text-muted-foreground mb-2">
                       Duration: {formatDuration(session.duration)}
                     </p>
-                    {session.transcriptText && (
-                      <p className="line-clamp-2 text-sm text-muted-foreground">
-                        {session.transcriptText.substring(0, 100)}
-                        {session.transcriptText.length > 100 ? "..." : ""}
-                      </p>
-                    )}
+                    <p className="line-clamp-3 text-sm text-muted-foreground">
+                      {getPreviewSnippet(session)}
+                    </p>
                   </CardContent>
                 </Card>
               </Link>

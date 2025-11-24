@@ -26,6 +26,27 @@ A full-stack Next.js application for real-time audio transcription and meeting s
 - Node.js 18+ and npm
 - Docker and Docker Compose (for local Postgres)
 - Google Gemini API key ([Get one here](https://ai.google.dev))
+- **FFmpeg** (required for audio format conversion)
+
+### Installing FFmpeg
+
+**macOS:**
+```bash
+brew install ffmpeg
+```
+
+**Ubuntu/Debian:**
+```bash
+sudo apt update && sudo apt install ffmpeg
+```
+
+**Windows:**
+Download from [FFmpeg website](https://ffmpeg.org/download.html) or use:
+```bash
+choco install ffmpeg
+```
+
+FFmpeg is required to convert WebM audio (from browser MediaRecorder) to MP3 format, which is supported by the Gemini API.
 
 ## Quick Start
 
@@ -142,12 +163,12 @@ graph TB
    - Express + Socket.io server on port 4000
    - Receives audio chunks from clients
    - Buffers audio in memory (with disk persistence)
-   - Chunks audio every 30 seconds for Gemini processing
+   - Chunks audio every 30 seconds for Gemini processing (as per PRD requirement)
    - Manages session state (recording, paused, processing, completed)
 
 3. **Audio Processing**
    - Server-side buffering with 2GB max per session
-   - Automatic chunking every 30 seconds
+   - Automatic chunking every 30 seconds (as per PRD requirement - provides better context for accurate transcription)
    - Converts audio to base64 for Gemini API
    - Handles stream interruptions and reconnections
 
@@ -190,7 +211,7 @@ graph TB
 
 ScribeAI is designed to handle sessions of 1+ hours through several architectural decisions:
 
-1. **Chunked Processing**: Audio is processed in 30-second chunks rather than waiting for the entire session. This prevents memory overload and provides incremental transcription results.
+1. **Chunked Processing**: Audio is processed in 5-second chunks (optimized for real-time transcription) rather than waiting for the entire session. This prevents memory overload and provides incremental transcription results with low latency.
 
 2. **Server-Side Buffering**: Audio chunks are buffered on the server with a 2GB per-session limit. This allows the server to continue processing even if the client disconnects temporarily.
 
