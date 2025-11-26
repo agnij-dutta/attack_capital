@@ -216,18 +216,71 @@ export class AudioProcessor {
     }
     this.lastChunkHashes.set(sessionId, chunkHash);
 
-    // Use combined buffer with pipe input to FFmpeg
-    // This handles fragmented WebM better by streaming the data directly
-    // The first chunk has a complete header, subsequent chunks are fragments
-    // FFmpeg can handle this when we pipe the combined data
-    try {
-      const conversionResult = await this.convertBufferToMp3WithPipe(combinedBuffer, mimeType, sessionId);
-      base64Audio = conversionResult.base64Audio;
-      finalMimeType = conversionResult.mimeType;
-      console.log(`[AudioProcessor] Successfully converted combined buffer (${totalSize} bytes) to ${finalMimeType} for session ${sessionId}`);
-    } catch (conversionError) {
-      console.error(`[AudioProcessor] Failed to convert combined buffer for session ${sessionId}, using original format:`, conversionError);
-      // Fall back to original format - let Gemini try to handle it
+    // For WebM fragments from MediaRecorder, we need to use a special approach:
+    // 1. Save chunks to temp files
+    // 2. Use FFmpeg concat filter which properly handles fragmented WebM
+    // This avoids EBML header parsing issues with concatenated buffers
+    const isWebM = mimeType?.toLowerCase().includes("webm");
+    const hasMultipleChunks = bufferList.length > 1;
+    
+    console.log(`[AudioProcessor] Conversion strategy: isWebM=${isWebM}, chunkCount=${bufferList.length}, mimeType=${mimeType}`);
+    
+    if (isWebM && hasMultipleChunks) {
+      // For WebM with multiple chunks, ALWAYS use concat filter approach (handles fragments properly)
+      console.log(`[AudioProcessor] Using concat filter method for WebM with ${bufferList.length} chunks`);
+      try {
+        const conversionResult = await this.convertWebMChunksWithConcatFilter(bufferList, mimeType, sessionId);
+        base64Audio = conversionResult.base64Audio;
+        finalMimeType = conversionResult.mimeType;
+        console.log(`[AudioProcessor] ✅ Successfully converted WebM chunks using concat filter (${bufferList.length} chunks) to ${finalMimeType} for session ${sessionId}`);
+      } catch (concatError) {
+        console.error(`[AudioProcessor] ❌ Concat filter conversion failed for session ${sessionId}:`, (concatError as Error).message?.substring(0, 300));
+        // If concat filter fails, try chunk-by-chunk conversion as fallback
+        try {
+          console.log(`[AudioProcessor] Trying chunk-by-chunk conversion as fallback...`);
+          const conversionResult = await this.convertChunksToMp3(bufferList, mimeType, sessionId);
+          base64Audio = conversionResult.base64Audio;
+          finalMimeType = conversionResult.mimeType;
+          console.log(`[AudioProcessor] ✅ Successfully converted chunks individually (${bufferList.length} chunks) to ${finalMimeType} for session ${sessionId}`);
+        } catch (chunkConversionError) {
+          console.error(`[AudioProcessor] ❌ Chunk-by-chunk conversion also failed for session ${sessionId}:`, (chunkConversionError as Error).message?.substring(0, 300));
+          // Final fallback - this will likely fail with Gemini but we try anyway
+          console.error(`[AudioProcessor] ⚠️ All conversion methods failed - using original WebM format (Gemini may reject this)`);
+        }
+      }
+    } else if (isWebM && !hasMultipleChunks) {
+      // Single WebM chunk - try pipe method
+      console.log(`[AudioProcessor] Using pipe method for single WebM chunk`);
+      try {
+        const conversionResult = await this.convertBufferToMp3WithPipe(combinedBuffer, mimeType, sessionId);
+        base64Audio = conversionResult.base64Audio;
+        finalMimeType = conversionResult.mimeType;
+        console.log(`[AudioProcessor] ✅ Successfully converted single WebM chunk using pipe method to ${finalMimeType} for session ${sessionId}`);
+      } catch (conversionError) {
+        console.error(`[AudioProcessor] ❌ Pipe conversion failed for single WebM chunk:`, (conversionError as Error).message?.substring(0, 300));
+        console.error(`[AudioProcessor] ⚠️ Using original WebM format (Gemini may reject this)`);
+      }
+    } else {
+      // For non-WebM formats, try pipe method first
+      console.log(`[AudioProcessor] Using pipe method for non-WebM format: ${mimeType}`);
+      try {
+        const conversionResult = await this.convertBufferToMp3WithPipe(combinedBuffer, mimeType, sessionId);
+        base64Audio = conversionResult.base64Audio;
+        finalMimeType = conversionResult.mimeType;
+        console.log(`[AudioProcessor] ✅ Successfully converted combined buffer (${totalSize} bytes) to ${finalMimeType} for session ${sessionId}`);
+      } catch (conversionError) {
+        console.warn(`[AudioProcessor] Pipe conversion failed for session ${sessionId}, trying chunk-by-chunk conversion:`, (conversionError as Error).message?.substring(0, 200));
+        // Fall back to processing chunks individually
+        try {
+          const conversionResult = await this.convertChunksToMp3(bufferList, mimeType, sessionId);
+          base64Audio = conversionResult.base64Audio;
+          finalMimeType = conversionResult.mimeType;
+          console.log(`[AudioProcessor] Successfully converted chunks individually (${bufferList.length} chunks) to ${finalMimeType} for session ${sessionId}`);
+        } catch (chunkConversionError) {
+          console.error(`[AudioProcessor] Chunk-by-chunk conversion also failed for session ${sessionId}, using original format:`, (chunkConversionError as Error).message?.substring(0, 200));
+          // Final fallback to original format - let Gemini try to handle it
+        }
+      }
     }
 
     try {
@@ -430,6 +483,117 @@ export class AudioProcessor {
       return { base64Audio, mimeType: "audio/mp3" };
     } catch (error: any) {
       console.error(`[AudioProcessor] FFmpeg concat filter failed:`, error.message?.substring(0, 300));
+      // Log stderr if available for debugging
+      if (error.stderr) {
+        console.error(`[AudioProcessor] FFmpeg stderr:`, error.stderr.substring(0, 500));
+      }
+      throw error;
+    } finally {
+      // Clean up temp directory (but keep debug MP3 if saved)
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /**
+   * Convert WebM chunks using FFmpeg concat filter
+   * This is the most reliable method for fragmented WebM from MediaRecorder
+   * It saves chunks to disk and uses concat filter to handle fragments properly
+   */
+  private async convertWebMChunksWithConcatFilter(
+    bufferChunks: Buffer[],
+    inputMimeType: string,
+    sessionId: string
+  ): Promise<{ base64Audio: string; mimeType: string }> {
+    if (bufferChunks.length === 0) {
+      throw new Error("No chunks provided for conversion");
+    }
+
+    const tempDir = await mkdtemp(join(tmpdir(), `session-${sessionId}-`));
+    const chunkFiles: string[] = [];
+
+    try {
+      // Step 1: Save each chunk to disk as WebM file
+      for (let i = 0; i < bufferChunks.length; i++) {
+        const chunk = bufferChunks[i];
+        const chunkFile = join(tempDir, `chunk-${i}.${this.getExtensionForMime(inputMimeType)}`);
+        await writeFile(chunkFile, chunk);
+        chunkFiles.push(chunkFile);
+      }
+
+      const outputFile = join(tempDir, `combined-${Date.now()}.mp3`);
+
+      // Step 2: Use FFmpeg concat filter to concatenate WebM chunks and convert to MP3
+      // This approach handles fragmented WebM properly by extracting audio streams
+      // The concat filter can handle fragments even without complete headers
+      // Build input arguments - specify format and error handling for each input
+      // Each input needs its own format specification for fragmented WebM
+      const inputArgs: string[] = [];
+      for (const file of chunkFiles) {
+        inputArgs.push("-f", "webm", "-err_detect", "ignore_err", "-fflags", "+genpts", "-i", file);
+      }
+      const inputArgsStr = inputArgs.join(" ");
+      
+      // Build concat filter: [0:a] [1:a] [2:a] ... concat=n=N:v=0:a=1 [outa]
+      // This extracts audio from each input and concatenates them
+      const audioInputs = chunkFiles.map((_, i) => `[${i}:a]`).join(" ");
+      const concatFilter = `${audioInputs} concat=n=${chunkFiles.length}:v=0:a=1 [outa]`;
+      
+      // Use concat filter to combine audio streams and convert to MP3
+      // Note: We don't quote file paths in the array, but we do quote the output file
+      const ffmpegCommand = `ffmpeg -y -loglevel warning ${inputArgsStr} -filter_complex "${concatFilter}" -map "[outa]" -acodec libmp3lame -ar 16000 -ac 1 -b:a 64k -f mp3 "${outputFile}"`;
+      
+      console.log(`[AudioProcessor] FFmpeg command for concat filter: ffmpeg -y -loglevel warning [${chunkFiles.length} inputs] -filter_complex "${concatFilter}" ...`);
+
+      const { stdout, stderr } = await execAsync(ffmpegCommand, {
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 60000,
+      });
+
+      // Verify output file
+      if (!existsSync(outputFile)) {
+        throw new Error("FFmpeg concat filter failed - output file not created");
+      }
+
+      const stats = await stat(outputFile);
+      if (stats.size === 0) {
+        throw new Error("FFmpeg concat filter produced empty file");
+      }
+
+      const mp3Buffer = await readFile(outputFile);
+      console.log(`[AudioProcessor] Converted ${chunkFiles.length} WebM chunks into ${stats.size} byte MP3 (${(stats.size / 1024).toFixed(1)} KB)`);
+
+      // Verify duration using ffprobe if available
+      try {
+        const { stdout: durationOut } = await execAsync(
+          `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
+          {
+            maxBuffer: 1024 * 1024,
+            timeout: 10000,
+          }
+        );
+        const duration = parseFloat(durationOut.trim());
+        console.log(`[AudioProcessor] MP3 duration: ${duration.toFixed(2)} seconds (expected ~30s)`);
+        if (duration < 5) {
+          console.warn(
+            `[AudioProcessor] ⚠️ WARNING: MP3 is only ${duration.toFixed(2)}s, expected ~30s. Audio may be truncated.`
+          );
+        } else if (duration >= 25 && duration <= 35) {
+          console.log(`[AudioProcessor] ✅ MP3 duration is correct: ${duration.toFixed(2)}s`);
+        }
+      } catch (probeError) {
+        // ffprobe not available or failed, continue anyway
+        console.warn(`[AudioProcessor] Could not verify MP3 duration: ${probeError}`);
+      }
+
+      const base64Audio = mp3Buffer.toString("base64");
+
+      if (SAVE_MP3_DEBUG) {
+        await this.saveDebugMp3(sessionId, mp3Buffer);
+      }
+
+      return { base64Audio, mimeType: "audio/mp3" };
+    } catch (error: any) {
+      console.error(`[AudioProcessor] WebM concat filter conversion failed:`, error.message?.substring(0, 300));
       // Log stderr if available for debugging
       if (error.stderr) {
         console.error(`[AudioProcessor] FFmpeg stderr:`, error.stderr.substring(0, 500));
